@@ -314,14 +314,14 @@ if run or "last_ticker" in st.session_state:
                 rangeselector=dict(
                     bgcolor="#1e2235",
                     activecolor="#7dd3fc",
-                    buttons=[
+                    buttons=list([
                         dict(count=1,  label="1M",  step="month", stepmode="backward"),
                         dict(count=3,  label="3M",  step="month", stepmode="backward"),
                         dict(count=6,  label="6M",  step="month", stepmode="backward"),
                         dict(count=1,  label="1Y",  step="year",  stepmode="backward"),
                         dict(count=3,  label="3Y",  step="year",  stepmode="backward"),
                         dict(step="all", label="Tümü"),
-                    ]
+                    ])
                 ),
             ),
             yaxis=dict(
