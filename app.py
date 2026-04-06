@@ -1,110 +1,280 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-from datetime import datetime, timedelta
+import numpy as np
+from datetime import datetime, date
+import warnings
+warnings.filterwarnings("ignore")
 
-# Sayfa Ayarları
-st.set_page_config(page_title="BIST Terminal", layout="wide")
+# ── Sayfa Ayarları ──────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="BIST30 Analiz",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-# Genel CSS
+# ── Şirket → Ticker Haritası ─────────────────────────────────────────────────
+TICKER_MAP = {
+    "Anadolu Efes": "AEFES.IS",
+    "Akbank": "AKBNK.IS",
+    "Aselsan": "ASELS.IS",
+    "BIM": "BIMAS.IS",
+    "Emlak Konut": "EKGYO.IS",
+    "ENKA": "ENKAI.IS",
+    "Erdemir": "EREGL.IS",
+    "Ford Otosan": "FROTO.IS",
+    "Garanti": "GARAN.IS",
+    "Gübretaş": "GUBRF.IS",
+    "İş Bankası": "ISCTR.IS",
+    "Koç Holding": "KCHOL.IS",
+    "Koza Altın": "KOZAL.IS",
+    "Kardemir": "KRDMD.IS",
+    "Migros": "MGROS.IS",
+    "Petkim": "PETKM.IS",
+    "Sabancı Holding": "SAHOL.IS",
+    "SASA": "SASA.IS",
+    "Şişecam": "SISE.IS",
+    "TAV": "TAVHL.IS",
+    "Turkcell": "TCELL.IS",
+    "THY": "THYAO.IS",
+    "Tofaş": "TOASO.IS",
+    "Türk Telekom": "TTKOM.IS",
+    "Tüpraş": "TUPRS.IS",
+    "Vakıfbank": "VAKBN.IS",
+    "Yapı Kredi": "YKBNK.IS",
+    "Pegasus": "PGSUS.IS",
+    "Astor": "ASTOR.IS",
+    "Destek Finans Faktoring": "DSTKF.IS",
+}
+
+# ── CSS ──────────────────────────────────────────────────────────────────────
 st.markdown("""
-    <style>
-    .stButton>button { width: 100%; border-radius: 5px; background-color: #ff4b4b; color: white; font-weight: bold; height: 3em; }
-    input { text-transform: uppercase; }
-    </style>
-    """, unsafe_allow_html=True)
+<style>
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;600&display=swap');
 
-st.title("🏛️ BIST Profesyonel Analiz Terminali")
+html, body, [class*="css"] {
+    font-family: 'IBM Plex Sans', sans-serif;
+}
+h1, h2, h3 {
+    font-family: 'IBM Plex Mono', monospace;
+}
+.metric-box {
+    background: #0f1117;
+    border: 1px solid #2a2d3e;
+    border-radius: 8px;
+    padding: 16px 20px;
+    margin-bottom: 8px;
+}
+.ticker-badge {
+    font-family: 'IBM Plex Mono', monospace;
+    background: #1e2235;
+    color: #7dd3fc;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 0.85em;
+    font-weight: 600;
+}
+.oldest-date {
+    font-size: 0.75em;
+    color: #6b7280;
+    font-family: 'IBM Plex Mono', monospace;
+}
+.pos { color: #22c55e; font-weight: 600; }
+.neg { color: #ef4444; font-weight: 600; }
+.neutral { color: #94a3b8; }
+</style>
+""", unsafe_allow_html=True)
 
-# --- SIDEBAR ---
+# ── Yardımcı Fonksiyonlar ────────────────────────────────────────────────────
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_data(ticker: str, start: str) -> pd.DataFrame:
+    df = yf.download(ticker, start=start, auto_adjust=True, progress=False)
+    if df.empty:
+        return pd.DataFrame()
+    df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+    return df
+
+def compute_metrics(df: pd.DataFrame) -> pd.DataFrame:
+    """Günlük kapanış, güniçi değişim, Amihud, Daily Range hesapla."""
+    out = pd.DataFrame(index=df.index)
+    out["Kapanış (₺)"]     = df["Close"].round(2)
+    out["Açılış (₺)"]      = df["Open"].round(2)
+    out["Yüksek (₺)"]      = df["High"].round(2)
+    out["Düşük (₺)"]       = df["Low"].round(2)
+    out["Hacim"]           = df["Volume"].astype(int)
+
+    # Günlük Kapanış Değişimi (önceki kapanışa göre %)
+    out["Günlük Değ. (%)"] = df["Close"].pct_change() * 100
+
+    # Güniçi Değişim: (Kapanış - Açılış) / Açılış * 100
+    out["Güniçi Değ. (%)"] = ((df["Close"] - df["Open"]) / df["Open"]) * 100
+
+    # Daily Range: (High - Low) / Low * 100
+    out["Daily Range (%)"] = ((df["High"] - df["Low"]) / df["Low"]) * 100
+
+    # Amihud İlliquidity: |Return| / TL Hacim  (×10^6 ölçeklendi)
+    tl_volume = df["Close"] * df["Volume"]
+    daily_return = df["Close"].pct_change().abs()
+    out["Amihud (×10⁶)"] = (daily_return / tl_volume * 1e6).replace([np.inf, -np.inf], np.nan)
+
+    return out.round(4)
+
+def color_val(val, col):
+    if pd.isna(val):
+        return '<span class="neutral">—</span>'
+    if col in ["Günlük Değ. (%)", "Güniçi Değ. (%)"]:
+        cls = "pos" if val > 0 else ("neg" if val < 0 else "neutral")
+        sign = "+" if val > 0 else ""
+        return f'<span class="{cls}">{sign}{val:.2f}%</span>'
+    if col == "Amihud (×10⁶)":
+        return f'<span class="neutral">{val:.4f}</span>'
+    if col == "Daily Range (%)":
+        return f'<span class="neutral">{val:.2f}%</span>'
+    if col == "Hacim":
+        return f'<span class="neutral">{int(val):,}</span>'
+    return f'<span class="neutral">{val:,.2f}</span>'
+
+# ── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.header("🔍 Veri Girişi")
-    symbol_raw = st.text_input("Sembol", placeholder="Örn: THYAO").strip().upper()
-    compare_raw = st.text_input("Korelasyon", value="XU100").strip().upper()
-    
-    st.divider()
-    # Varsayılan son 1 yıl ama kullanıcı 2000'e kadar gidebilir
-    g_start = st.date_input("Başlangıç", value=datetime.now() - timedelta(days=365), min_value=datetime(1990, 1, 1))
-    g_end = st.date_input("Bitiş", value=datetime.now())
-    
-    st.divider()
-    run_analysis = st.button("ANALİZİ BAŞLAT")
+    st.markdown("## 📊 BIST30 Konsol")
+    st.markdown("---")
 
-def format_bist(s):
-    if not s: return None
-    return f"{s}.IS" if not s.endswith(".IS") else s
+    company_names = sorted(TICKER_MAP.keys())
+    selected_company = st.selectbox(
+        "🔍 Şirket Seç",
+        options=company_names,
+        index=company_names.index("Garanti"),
+        help="Şirket adını yazarak filtreleyebilirsiniz"
+    )
 
-if run_analysis and symbol_raw:
-    with st.spinner('Veriler toplanıyor...'):
-        t = format_bist(symbol_raw)
-        ct = format_bist(compare_raw)
-        
-        df = yf.download(t, start=g_start, end=g_end)
-        df_c = yf.download(ct, start=g_start, end=g_end)
+    ticker = TICKER_MAP[selected_company]
+    st.markdown(f"**Ticker:** <span class='ticker-badge'>{ticker}</span>", unsafe_allow_html=True)
 
-        if not df.empty:
-            # MultiIndex Sütun Temizliği (Hata almamak için şart)
-            if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-            if isinstance(df_c.columns, pd.MultiIndex): df_c.columns = df_c.columns.get_level_values(0)
+    st.markdown("---")
+    st.markdown("**📅 Başlangıç Tarihi**")
+    start_date = st.date_input(
+        "Başlangıç",
+        value=date(2010, 1, 1),
+        min_value=date(2000, 1, 1),
+        max_value=date.today(),
+        label_visibility="collapsed"
+    )
 
-            # --- HESAPLAMALAR (İLK VERSİYONA DÖNÜŞ) ---
-            df['Daily Range'] = (df['High'] - df['Low']).round(2)
-            df['Pct'] = df['Close'].pct_change() * 100
-            
-            # Amihud Formülü: İlk düzgün çalışan 10^6 (1 Milyon) çarpanına döndük
-            df['Amihud'] = (df['Pct'].abs() / (df['Volume'] / 1000000)).round(4)
+    n_rows = st.slider("Gösterilecek Satır Sayısı", 10, 500, 60, 10)
 
-            # --- 1. ANA GRAFİK ---
-            st.subheader(f"📊 {symbol_raw} Candlestick & Hacim Profili")
-            fig1 = make_subplots(rows=1, cols=2, shared_yaxes=True, column_widths=[0.85, 0.15], horizontal_spacing=0.01)
-            fig1.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="Fiyat"), row=1, col=1)
-            
-            # Hacim Profili (VRP)
-            v_df = df.tail(100).dropna()
-            v_bins = pd.cut(v_df['Close'], bins=20)
-            v_prof = v_df.groupby(v_bins, observed=True)['Volume'].sum()
-            fig1.add_trace(go.Bar(x=v_prof.values, y=[i.mid for i in v_prof.index], orientation='h', marker_color='rgba(255, 75, 75, 0.3)'), row=1, col=2)
-            
-            fig1.update_layout(height=500, template="plotly_dark", showlegend=False, xaxis=dict(rangeslider_visible=True))
-            st.plotly_chart(fig1, use_container_width=True)
+    st.markdown("---")
+    run = st.button("⚡ Veriyi Çek", use_container_width=True, type="primary")
 
-            # --- 2. TABLO ---
-            st.divider()
-            st.subheader("📅 Detay Veri Listesi")
-            df_out = df.tail(60).copy()
-            df_out['Değişim %'] = df_out['Pct'].apply(lambda x: f"🟢 +%{x:.2f}" if x > 0 else f"🔴 -%{abs(x):.2f}" if x < 0 else "⚪ 0.00")
-            st.dataframe(df_out[['Open', 'High', 'Low', 'Close', 'Volume', 'Daily Range', 'Amihud', 'Değişim %']].sort_index(ascending=False), use_container_width=True, height=350)
+# ── Ana Alan ─────────────────────────────────────────────────────────────────
+st.markdown("# 📈 BIST30 Günlük Analiz Tablosu")
 
-            # --- 3. DUAL AXIS ANALİZLER (HATASIZ MODERN YAZIM) ---
-            st.divider()
-            
-            def make_dual(y1, n1, c1, y2, n2, c2, dash=None):
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(x=df.index, y=y1, name=n1, line=dict(color=c1, width=2.5), yaxis="y1"))
-                fig.add_trace(go.Scatter(x=df.index, y=y2, name=n2, line=dict(color=c2, width=2.5, dash=dash), yaxis="y2"))
-                
-                fig.update_layout(
-                    template="plotly_dark", height=450,
-                    yaxis=dict(title=dict(text=n1, font=dict(color=c1)), tickfont=dict(color=c1), autorange=True),
-                    yaxis2=dict(title=dict(text=n2, font=dict(color=c2)), tickfont=dict(color=c2), anchor="x", overlaying="y", side="right", autorange=True),
-                    xaxis=dict(rangeslider_visible=True), # ALTTAKİ AYRAÇLAR
-                    hovermode="x unified", margin=dict(t=50, b=50)
-                )
-                st.plotly_chart(fig, use_container_width=True)
+if run or "last_ticker" in st.session_state:
+    if run:
+        st.session_state["last_ticker"] = ticker
+        st.session_state["last_start"]  = str(start_date)
+        st.session_state["last_company"] = selected_company
 
-            # Grafik 1: Amihud (Sol) vs Daily Range (Sağ)
-            st.subheader(f"📉 {symbol_raw} - Amihud (Sol) vs Daily Range (Sağ)")
-            make_dual(df['Amihud'], "Amihud (Likidite)", "#00FFCC", df['Daily Range'], "Daily Range", "#FFD700", dash='dot')
-            
-            # Grafik 2: Daily Range vs Close
-            st.subheader(f"📈 {symbol_raw} - Fiyat (Sol) vs Daily Range (Sağ)")
-            make_dual(df['Close'], "Fiyat (Close)", "#FFFFFF", df['Daily Range'], "Daily Range", "#FFD700")
+    _ticker  = st.session_state.get("last_ticker", ticker)
+    _start   = st.session_state.get("last_start", str(start_date))
+    _company = st.session_state.get("last_company", selected_company)
 
-            # Grafik 3: Amihud vs Close
-            st.subheader(f"🧪 {symbol_raw} - Fiyat (Sol) vs Amihud (Sağ)")
-            make_dual(df['Close'], "Fiyat (Close)", "#FFFFFF", df['Amihud'], "Amihud", "#00FFCC")
+    with st.spinner(f"{_company} verisi çekiliyor..."):
+        raw = fetch_data(_ticker, _start)
 
+    if raw.empty:
+        st.error(f"❌ {_ticker} için veri bulunamadı.")
+    else:
+        oldest = raw.index.min().strftime("%d.%m.%Y")
+        newest = raw.index.max().strftime("%d.%m.%Y")
+        total  = len(raw)
+
+        # Üst bilgi kartları
+        col1, col2, col3, col4 = st.columns(4)
+        last_close = raw["Close"].iloc[-1]
+        prev_close = raw["Close"].iloc[-2] if len(raw) > 1 else last_close
+        chg = ((last_close - prev_close) / prev_close) * 100
+        chg_sign = "+" if chg > 0 else ""
+
+        col1.metric("Şirket", f"{_company}", f"{_ticker}")
+        col2.metric("Son Kapanış", f"₺{last_close:.2f}", f"{chg_sign}{chg:.2f}%")
+        col3.metric("En Eski Veri", oldest)
+        col4.metric("Toplam Gün", f"{total:,}")
+
+        st.markdown("---")
+
+        # Metrik tablosu
+        metrics = compute_metrics(raw)
+        display = metrics.iloc[::-1].head(n_rows)  # En yeniden eskiye
+
+        # HTML tablo oluştur
+        cols_show = [
+            "Kapanış (₺)", "Açılış (₺)", "Yüksek (₺)", "Düşük (₺)",
+            "Hacim", "Günlük Değ. (%)", "Güniçi Değ. (%)",
+            "Daily Range (%)", "Amihud (×10⁶)"
+        ]
+
+        header = "<tr><th>Tarih</th>" + "".join(f"<th>{c}</th>" for c in cols_show) + "</tr>"
+        rows = ""
+        for idx, row in display.iterrows():
+            date_str = idx.strftime("%d.%m.%Y")
+            cells = "".join(f"<td>{color_val(row[c], c)}</td>" for c in cols_show)
+            rows += f"<tr><td><span style='font-family:IBM Plex Mono;font-size:0.85em;color:#94a3b8'>{date_str}</span></td>{cells}</tr>"
+
+        table_html = f"""
+        <style>
+        .data-table {{
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.82em;
+            margin-top: 8px;
+        }}
+        .data-table th {{
+            background: #1e2235;
+            color: #7dd3fc;
+            font-family: 'IBM Plex Mono', monospace;
+            font-weight: 600;
+            padding: 10px 12px;
+            text-align: right;
+            border-bottom: 2px solid #2a2d3e;
+            white-space: nowrap;
+        }}
+        .data-table th:first-child {{ text-align: left; }}
+        .data-table td {{
+            padding: 8px 12px;
+            text-align: right;
+            border-bottom: 1px solid #1e2235;
+        }}
+        .data-table td:first-child {{ text-align: left; }}
+        .data-table tr:hover td {{ background: #141824; }}
+        </style>
+        <div style="overflow-x:auto; max-height:65vh; overflow-y:auto;">
+        <table class="data-table">
+        <thead>{header}</thead>
+        <tbody>{rows}</tbody>
+        </table>
+        </div>
+        """
+        st.markdown(table_html, unsafe_allow_html=True)
+
+        # İndir butonu
+        st.markdown("---")
+        csv = metrics.iloc[::-1].to_csv(encoding="utf-8-sig")
+        st.download_button(
+            label="📥 CSV İndir (Tüm Veri)",
+            data=csv,
+            file_name=f"{_ticker}_{oldest.replace('.','')}_to_{newest.replace('.','')}.csv",
+            mime="text/csv"
+        )
 else:
-    st.info("👈 Başlamak için sembol girin ve 'Analizi Başlat'a tıklayın.")
+    st.info("👈 Soldaki konsoldan bir şirket seçip **⚡ Veriyi Çek** butonuna tıklayın.")
+    st.markdown("""
+    ### Tablodaki Göstergeler
+
+    | Gösterge | Açıklama |
+    |---|---|
+    | **Günlük Değ. (%)** | Önceki kapanışa göre değişim |
+    | **Güniçi Değ. (%)** | (Kapanış − Açılış) / Açılış × 100 |
+    | **Daily Range (%)** | (Yüksek − Düşük) / Düşük × 100 |
+    | **Amihud (×10⁶)** | \|Getiri\| / TL Hacim × 10⁶ — düşük = likit |
+    """)
