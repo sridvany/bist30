@@ -190,8 +190,8 @@ with st.sidebar:
     st.markdown("**📅 Başlangıç Tarihi**")
     start_date = st.date_input(
         "Başlangıç",
-        value=date(2010, 1, 1),
-        min_value=date(2000, 1, 1),
+        value=date(1990, 1, 1),
+        min_value=date(1990, 1, 1),
         max_value=date.today(),
         label_visibility="collapsed"
     )
@@ -260,6 +260,24 @@ if run or "last_ticker" in st.session_state:
         # Metrik tablosu
         metrics = compute_metrics(raw)
         display = metrics.iloc[::-1].head(n_rows)  # En yeniden eskiye
+
+        # ── Özet: Artış / Düşüş günleri Daily Range ortalaması ──────────────
+        up_days   = metrics[metrics["Güniçi Değ. (%)"] > 0]
+        down_days = metrics[metrics["Güniçi Değ. (%)"] < 0]
+        avg_range_up_tl   = up_days["Daily Range (₺)"].mean()
+        avg_range_down_tl = down_days["Daily Range (₺)"].mean()
+        avg_range_up_pct  = up_days["Daily Range (%)"].mean()
+        avg_range_down_pct= down_days["Daily Range (%)"].mean()
+
+        sc1, sc2, sc3, sc4 = st.columns(4)
+        sc1.metric("📗 Artış Günü Ort. Range (₺)",
+                   f"₺{avg_range_up_tl:.2f}", f"{avg_range_up_pct:.2f}%")
+        sc2.metric("📗 Artış Günü Sayısı", f"{len(up_days):,}")
+        sc3.metric("📕 Düşüş Günü Ort. Range (₺)",
+                   f"₺{avg_range_down_tl:.2f}", f"{avg_range_down_pct:.2f}%",
+                   delta_color="off")
+        sc4.metric("📕 Düşüş Günü Sayısı", f"{len(down_days):,}")
+        st.markdown("---")
 
         # HTML tablo oluştur
         cols_show = [
