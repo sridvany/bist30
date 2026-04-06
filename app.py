@@ -10,45 +10,11 @@ warnings.filterwarnings("ignore")
 
 # ── Sayfa Ayarları ──────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="BIST30 Analiz",
+    page_title="Likidite Analizi",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded"
 )
-
-# ── Şirket → Ticker Haritası ─────────────────────────────────────────────────
-TICKER_MAP = {
-    "Anadolu Efes": "AEFES.IS",
-    "Akbank": "AKBNK.IS",
-    "Aselsan": "ASELS.IS",
-    "BIM": "BIMAS.IS",
-    "Emlak Konut": "EKGYO.IS",
-    "ENKA": "ENKAI.IS",
-    "Erdemir": "EREGL.IS",
-    "Ford Otosan": "FROTO.IS",
-    "Garanti": "GARAN.IS",
-    "Gübretaş": "GUBRF.IS",
-    "İş Bankası": "ISCTR.IS",
-    "Koç Holding": "KCHOL.IS",
-    "Koza Altın": "KOZAL.IS",
-    "Kardemir": "KRDMD.IS",
-    "Migros": "MGROS.IS",
-    "Petkim": "PETKM.IS",
-    "Sabancı Holding": "SAHOL.IS",
-    "SASA": "SASA.IS",
-    "Şişecam": "SISE.IS",
-    "TAV": "TAVHL.IS",
-    "Turkcell": "TCELL.IS",
-    "THY": "THYAO.IS",
-    "Tofaş": "TOASO.IS",
-    "Türk Telekom": "TTKOM.IS",
-    "Tüpraş": "TUPRS.IS",
-    "Vakıfbank": "VAKBN.IS",
-    "Yapı Kredi": "YKBNK.IS",
-    "Pegasus": "PGSUS.IS",
-    "Astor": "ASTOR.IS",
-    "Destek Finans Faktoring": "DSTKF.IS",
-}
 
 # ── CSS ──────────────────────────────────────────────────────────────────────
 st.markdown("""
@@ -137,23 +103,15 @@ def compute_metrics(df: pd.DataFrame) -> pd.DataFrame:
     out["Düşük (₺)"]       = df["Low"].round(2)
     out["Hacim"]           = df["Volume"].astype(int)
 
-    # Günlük Kapanış Değişimi (önceki kapanışa göre %)
     out["Günlük Değ. (%)"] = df["Close"].pct_change() * 100
-
-    # Güniçi Değişim: (Kapanış - Açılış) / Açılış * 100
     out["Güniçi Değ. (%)"] = ((df["Close"] - df["Open"]) / df["Open"]) * 100
-
-    # Daily Range: High - Low (mutlak fark)
     out["Daily Range (₺)"] = (df["High"] - df["Low"]).round(2)
-    # Daily Range %: (High - Low) / Low * 100
     out["Daily Range (%)"] = ((df["High"] - df["Low"]) / df["Low"] * 100).round(2)
 
-    # Amihud İlliquidity: |Return| / TL Hacim  (×10^6 ölçeklendi)
     tl_volume = df["Close"] * df["Volume"]
     daily_return = df["Close"].pct_change().abs()
     out["Amihud (×10⁶)"] = (daily_return / tl_volume * 1e6).replace([np.inf, -np.inf], np.nan)
 
-    # Amihud hariç diğerlerini yuvarla, Amihud tam hassasiyette kalsın
     amihud = out["Amihud (×10⁶)"].copy()
     out = out.round(4)
     out["Amihud (×10⁶)"] = amihud
@@ -181,19 +139,15 @@ def color_val(val, col):
 
 # ── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("## 📊 BIST30 Konsol")
+    st.markdown("## 📊 Likidite Analizi")
     st.markdown("---")
 
-    company_names = sorted(TICKER_MAP.keys())
-    selected_company = st.selectbox(
-        "🔍 Şirket Seç",
-        options=company_names,
-        index=company_names.index("Garanti"),
-        help="Şirket adını yazarak filtreleyebilirsiniz"
-    )
-
-    ticker = TICKER_MAP[selected_company]
-    st.markdown(f"**Ticker:** <span class='ticker-badge'>{ticker}</span>", unsafe_allow_html=True)
+    ticker_input = st.text_input(
+        "🔍 Ticker",
+        value="GARAN.IS",
+        placeholder="Örn: GARAN.IS, AAPL, BTC-USD",
+        help="Herhangi bir yFinance ticker girin"
+    ).strip().upper()
 
     st.markdown("---")
     st.markdown("**📅 Başlangıç Tarihi**")
@@ -226,59 +180,52 @@ with st.sidebar:
         )
 
 # ── Ana Alan ─────────────────────────────────────────────────────────────────
-st.markdown("# 📈 BIST30 Günlük Analiz Tablosu")
+st.markdown("# 📈 Likidite Analizi")
 
 if run or "last_ticker" in st.session_state:
     if run:
-        st.session_state["last_ticker"] = ticker
+        st.session_state["last_ticker"] = ticker_input
         st.session_state["last_start"]  = str(start_date)
-        st.session_state["last_company"] = selected_company
 
-    _ticker  = st.session_state.get("last_ticker", ticker)
-    _start   = st.session_state.get("last_start", str(start_date))
-    _company = st.session_state.get("last_company", selected_company)
+    _ticker    = st.session_state.get("last_ticker", ticker_input)
+    _start     = st.session_state.get("last_start", str(start_date))
     _secondary = secondary_metric
 
-    with st.spinner(f"{_company} verisi çekiliyor..."):
+    with st.spinner(f"{_ticker} verisi çekiliyor..."):
         raw = fetch_data(_ticker, _start)
         live = fetch_live(_ticker)
 
-    # Anlık satırı birleştir (bugünün kapanışı henüz yoksa ekle)
     if live is not None and not raw.empty:
         today_ts = pd.Timestamp(date.today())
         if today_ts not in raw.index:
             raw = pd.concat([raw, live.to_frame().T])
         else:
-            # Güniçi verilerle güncelle
             for col in ["Open", "High", "Low", "Close", "Volume"]:
                 raw.at[today_ts, col] = live[col]
 
     if raw.empty:
-        st.error(f"❌ {_ticker} için veri bulunamadı.")
+        st.error(f"❌ {_ticker} için veri bulunamadı. Ticker'ı kontrol edin.")
     else:
         oldest = raw.index.min().strftime("%d.%m.%Y")
         newest = raw.index.max().strftime("%d.%m.%Y")
         total  = len(raw)
 
-        # Üst bilgi kartları
         col1, col2, col3, col4 = st.columns(4)
         last_close = raw["Close"].iloc[-1]
         prev_close = raw["Close"].iloc[-2] if len(raw) > 1 else last_close
         chg = ((last_close - prev_close) / prev_close) * 100
         chg_sign = "+" if chg > 0 else ""
 
-        col1.metric("Şirket", f"{_company}", f"{_ticker}")
-        col2.metric("Son Kapanış", f"₺{last_close:.2f}", f"{chg_sign}{chg:.2f}%")
+        col1.metric("Ticker", f"{_ticker}")
+        col2.metric("Son Kapanış", f"{last_close:.2f}", f"{chg_sign}{chg:.2f}%")
         col3.metric("En Eski Veri", oldest)
         col4.metric("Toplam Gün", f"{total:,}")
 
         st.markdown("---")
 
-        # Metrik tablosu
         metrics = compute_metrics(raw)
-        display = metrics.iloc[::-1].head(n_rows)  # En yeniden eskiye
+        display = metrics.iloc[::-1].head(n_rows)
 
-        # ── Özet: Artış / Düşüş günleri Daily Range ortalaması ──────────────
         up_days   = metrics[metrics["Güniçi Değ. (%)"] > 0]
         down_days = metrics[metrics["Güniçi Değ. (%)"] < 0]
         avg_range_up_tl   = up_days["Daily Range (₺)"].mean()
@@ -288,10 +235,10 @@ if run or "last_ticker" in st.session_state:
 
         sc1, sc2, sc3, sc4 = st.columns(4)
         sc1.metric("📗 Artış Günü Ort. Range (₺)",
-                   f"₺{avg_range_up_tl:.2f}", f"{avg_range_up_pct:.2f}%")
+                   f"{avg_range_up_tl:.2f}", f"{avg_range_up_pct:.2f}%")
         sc2.metric("📗 Artış Günü Sayısı", f"{len(up_days):,}")
         sc3.metric("📕 Düşüş Günü Ort. Range (₺)",
-                   f"₺{avg_range_down_tl:.2f}", f"{avg_range_down_pct:.2f}%",
+                   f"{avg_range_down_tl:.2f}", f"{avg_range_down_pct:.2f}%",
                    delta_color="off")
         sc4.metric("📕 Düşüş Günü Sayısı", f"{len(down_days):,}")
         st.markdown("---")
@@ -302,11 +249,10 @@ if run or "last_ticker" in st.session_state:
         fig.add_trace(go.Scatter(
             x=metrics.index,
             y=metrics["Kapanış (₺)"],
-            name="Kapanış (₺)",
+            name="Kapanış",
             line=dict(color="#22c55e", width=1.5),
         ), secondary_y=False)
 
-        # İkinci eksen verisi
         sec_col  = _secondary
         sec_data = metrics[sec_col].dropna()
 
@@ -365,7 +311,7 @@ if run or "last_ticker" in st.session_state:
             ),
         )
         fig.update_yaxes(
-            title_text="Kapanış (₺)",
+            title_text="Kapanış",
             title_font=dict(color="#22c55e"),
             tickfont=dict(color="#22c55e"),
             showgrid=True,
@@ -385,7 +331,6 @@ if run or "last_ticker" in st.session_state:
         st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True, "modeBarButtonsToAdd": ["pan2d"], "displayModeBar": True})
         st.markdown("---")
 
-        # HTML tablo oluştur
         cols_show = [
             "Kapanış (₺)", "Açılış (₺)", "Yüksek (₺)", "Düşük (₺)",
             "Hacim", "Günlük Değ. (%)", "Güniçi Değ. (%)",
@@ -445,7 +390,6 @@ if run or "last_ticker" in st.session_state:
         st.markdown("---")
         st.markdown("### 🔗 Close · Daily Range · Amihud İlişki Analizi")
 
-        # Analiz için log Amihud kullan
         ana = pd.DataFrame({
             "Close":       metrics["Kapanış (₺)"],
             "Daily Range": metrics["Daily Range (%)"],
@@ -455,7 +399,6 @@ if run or "last_ticker" in st.session_state:
 
         from scipy.stats import spearmanr
 
-        # 1. Spearman Korelasyon Heatmap
         cols3 = ["Close", "Daily Range", "Amihud (log)"]
         corr_matrix = np.zeros((3, 3))
         for i, c1 in enumerate(cols3):
@@ -482,7 +425,6 @@ if run or "last_ticker" in st.session_state:
         )
         st.plotly_chart(heat_fig, use_container_width=True)
 
-        # 3. Rolling Spearman Korelasyon (60 günlük)
         st.markdown("**Rolling Spearman Korelasyon (60 gün)**")
         roll_window = 60
         pairs = [
@@ -515,7 +457,6 @@ if run or "last_ticker" in st.session_state:
         )
         st.plotly_chart(roll_fig, use_container_width=True, config={"scrollZoom": True, "dragmode": "pan"})
 
-        # 4. Rejim Analizi — Daily Range medyanına göre yüksek/düşük volatilite
         st.markdown("**Volatilite Rejimi (Daily Range medyanı bazlı)**")
         median_dr = ana["Daily Range"].median()
         ana["Rejim"] = ana["Daily Range"].apply(lambda x: "Yüksek Vol." if x >= median_dr else "Düşük Vol.")
@@ -535,12 +476,11 @@ if run or "last_ticker" in st.session_state:
             legend=dict(orientation="h", y=1.1, bgcolor="rgba(0,0,0,0)"),
             margin=dict(l=10, r=10, t=30, b=10),
             height=300,
-            yaxis=dict(title="Kapanış (₺)", showgrid=True, gridcolor="#1e2235"),
+            yaxis=dict(title="Kapanış", showgrid=True, gridcolor="#1e2235"),
             xaxis=dict(showgrid=False),
         )
         st.plotly_chart(reg_fig, use_container_width=True, config={"scrollZoom": True, "dragmode": "pan"})
 
-        # İndir butonu
         st.markdown("---")
         csv = metrics.iloc[::-1].to_csv(encoding="utf-8-sig")
         st.download_button(
@@ -550,7 +490,7 @@ if run or "last_ticker" in st.session_state:
             mime="text/csv"
         )
 else:
-    st.info("👈 Soldaki konsoldan bir şirket seçip **⚡ Veriyi Çek** butonuna tıklayın.")
+    st.info("👈 Soldaki konsoldan bir ticker girin ve **⚡ Veriyi Çek** butonuna tıklayın.")
     st.markdown("""
     ### Tablodaki Göstergeler
 
@@ -558,6 +498,6 @@ else:
     |---|---|
     | **Günlük Değ. (%)** | Önceki kapanışa göre değişim |
     | **Güniçi Değ. (%)** | (Kapanış − Açılış) / Açılış × 100 |
-    | **Daily Range (₺)** | Yüksek − Düşük (TL cinsinden mutlak fark) |
-    | **Amihud (×10⁶)** | \|Getiri\| / TL Hacim × 10⁶ — düşük = likit |
+    | **Daily Range (₺)** | Yüksek − Düşük (mutlak fark) |
+    | **Amihud (×10⁶)** | \|Getiri\| / Hacim × 10⁶ — düşük = likit |
     """)
