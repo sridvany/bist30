@@ -116,8 +116,8 @@ def compute_metrics(df: pd.DataFrame) -> pd.DataFrame:
     # Güniçi Değişim: (Kapanış - Açılış) / Açılış * 100
     out["Güniçi Değ. (%)"] = ((df["Close"] - df["Open"]) / df["Open"]) * 100
 
-    # Daily Range: (High - Low) / Low * 100
-    out["Daily Range (%)"] = ((df["High"] - df["Low"]) / df["Low"]) * 100
+    # Daily Range: High - Low (mutlak fark)
+    out["Daily Range (₺)"] = (df["High"] - df["Low"]).round(2)
 
     # Amihud İlliquidity: |Return| / TL Hacim  (×10^6 ölçeklendi)
     tl_volume = df["Close"] * df["Volume"]
@@ -135,8 +135,8 @@ def color_val(val, col):
         return f'<span class="{cls}">{sign}{val:.2f}%</span>'
     if col == "Amihud (×10⁶)":
         return f'<span class="neutral">{val:.4f}</span>'
-    if col == "Daily Range (%)":
-        return f'<span class="neutral">{val:.2f}%</span>'
+    if col == "Daily Range (₺)":
+        return f'<span class="neutral">{val:.2f}</span>'
     if col == "Hacim":
         return f'<span class="neutral">{int(val):,}</span>'
     return f'<span class="neutral">{val:,.2f}</span>'
@@ -217,7 +217,7 @@ if run or "last_ticker" in st.session_state:
         cols_show = [
             "Kapanış (₺)", "Açılış (₺)", "Yüksek (₺)", "Düşük (₺)",
             "Hacim", "Günlük Değ. (%)", "Güniçi Değ. (%)",
-            "Daily Range (%)", "Amihud (×10⁶)"
+            "Daily Range (₺)", "Amihud (×10⁶)"
         ]
 
         header = "<tr><th>Tarih</th>" + "".join(f"<th>{c}</th>" for c in cols_show) + "</tr>"
@@ -281,6 +281,6 @@ else:
     |---|---|
     | **Günlük Değ. (%)** | Önceki kapanışa göre değişim |
     | **Güniçi Değ. (%)** | (Kapanış − Açılış) / Açılış × 100 |
-    | **Daily Range (%)** | (Yüksek − Düşük) / Düşük × 100 |
+    | **Daily Range (₺)** | Yüksek − Düşük (TL cinsinden mutlak fark) |
     | **Amihud (×10⁶)** | \|Getiri\| / TL Hacim × 10⁶ — düşük = likit |
     """)
