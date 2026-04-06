@@ -532,12 +532,19 @@ if run or "last_ticker" in st.session_state:
         st.plotly_chart(reg_fig, use_container_width=True, config={"scrollZoom": True, "dragmode": "pan"})
 
         st.markdown("---")
-        csv = metrics.iloc[::-1].to_csv(encoding="utf-8-sig")
+        import io
+        excel_df = metrics.iloc[::-1].copy()
+        excel_df.index.name = "Date"
+        excel_df = excel_df.reset_index()
+        excel_df["Date"] = excel_df["Date"].dt.strftime("%d.%m.%Y")
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            excel_df.to_excel(writer, index=False, sheet_name=_ticker)
         st.download_button(
-            label="📥 CSV İndir (Tüm Veri)",
-            data=csv,
-            file_name=f"{_ticker}_{oldest.replace('.','')}_to_{newest.replace('.','')}.csv",
-            mime="text/csv"
+            label="📥 Excel İndir (Tüm Veri)",
+            data=buf.getvalue(),
+            file_name=f"{_ticker}_{newest.replace('.','')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 else:
     st.info("👈 Soldaki konsoldan bir ticker girin ve **⚡ Veriyi Çek** butonuna tıklayın.")
