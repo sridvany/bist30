@@ -298,6 +298,18 @@ if run or "last_ticker" in st.session_state:
             marker_color="rgba(125, 211, 252, 0.35)",
         ), secondary_y=True)
 
+        # Daily Range trend çizgisi (lineer regresyon)
+        dr = metrics["Daily Range (%)"].dropna()
+        x_num = np.arange(len(dr))
+        z = np.polyfit(x_num, dr.values, 1)
+        trend = np.poly1d(z)(x_num)
+        fig.add_trace(go.Scatter(
+            x=dr.index,
+            y=trend,
+            name="Range Trend",
+            line=dict(color="#f59e0b", width=1.5, dash="dot"),
+        ), secondary_y=True)
+
         fig.update_layout(
             paper_bgcolor="#0f1117",
             plot_bgcolor="#0f1117",
