@@ -5,7 +5,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 # Sayfa Ayarları
-st.set_page_config(page_title="BIST Terminal", layout="wide")
+st.set_page_config(page_title="BIST Analiz Paneli", layout="wide")
 
 st.markdown("""
     <style>
@@ -14,7 +14,7 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-st.title("📈 BIST Profesyonel Günlük Trade & Likidite Terminali")
+st.title("🚀 BIST Gelişmiş Likidite ve Volatilite Terminali")
 
 # --- SIDEBAR ---
 with st.sidebar:
@@ -36,14 +36,13 @@ if run_analysis:
             ticker = format_bist(symbol_raw)
             comp_ticker = format_bist(compare_raw)
             
-            # Daha uzun veri çekiyoruz ki sağa sola kaydırırken boşluk kalmasın
             df = yf.download(ticker, period="1y", interval="1d")
             df_comp = yf.download(comp_ticker, period="1y", interval="1d")
 
             if df.empty or len(df) < 5:
                 st.error(f"❌ {symbol_raw} verisi bulunamadı.")
             else:
-                # Sütun temizliği
+                # MultiIndex temizliği
                 if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
                 if isinstance(df_comp.columns, pd.MultiIndex): df_comp.columns = df_comp.columns.get_level_values(0)
 
@@ -52,75 +51,77 @@ if run_analysis:
                 df['Pct_Change'] = df['Close'].pct_change() * 100
                 df['Amihud'] = (df['Pct_Change'].abs() / (df['Volume'] / 1000000)).round(4)
 
-                # --- 1. GRAFİK (TAM İNTERAKTİF) ---
+                # --- 1. ANA GRAFİK (CANDLESTICK + VRP) ---
                 col_left, col_right = st.columns([3, 1])
-                
                 with col_left:
-                    st.subheader(f"📊 {symbol_raw} Teknik Görünüm")
-                    # Son 60 günü başlangıçta göster ama tüm yılı yükle (sağa-sola kaydırma için)
-                    view_df = df.tail(100) 
+                    st.subheader(f"📊 {symbol_raw} Fiyat ve Hacim Profili")
+                    fig_main = make_subplots(rows=1, cols=2, shared_yaxes=True, column_widths=[0.85, 0.15], horizontal_spacing=0.01)
                     
-                    fig = make_subplots(rows=1, cols=2, shared_yaxes=True, 
-                                        column_widths=[0.85, 0.15], horizontal_spacing=0.01)
-                    
-                    # Candlestick
-                    fig.add_trace(go.Candlestick(
-                        x=df.index, open=df['Open'], high=df['High'], 
-                        low=df['Low'], close=df['Close'], name=symbol_raw
-                    ), row=1, col=1)
+                    fig_main.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="Fiyat"), row=1, col=1)
 
-                    # Hacim Profili (VRP)
-                    bins = 20
-                    df_vrp = df.tail(30) # VRP'yi son 30 güne göre hesapla
-                    df_vrp['PriceBin'] = pd.cut(df_vrp['Close'], bins=bins)
+                    # VRP
+                    df_vrp = df.tail(30)
+                    df_vrp['PriceBin'] = pd.cut(df_vrp['Close'], bins=15)
                     vprofile = df_vrp.groupby('PriceBin', observed=True)['Volume'].sum()
-                    bin_centers = [i.mid for i in vprofile.index]
+                    fig_main.add_trace(go.Bar(x=vprofile.values, y=[i.mid for i in vprofile.index], orientation='h', marker_color='rgba(255, 75, 75, 0.3)', name="Hacim"), row=1, col=2)
 
-                    fig.add_trace(go.Bar(
-                        x=vprofile.values, y=bin_centers, orientation='h',
-                        marker_color='rgba(255, 75, 75, 0.3)', name="Hacim Profili"
-                    ), row=1, col=2)
-
-                    # İNTERAKTİF AYARLAR
-                    fig.update_layout(
-                        xaxis_rangeslider_visible=True, # Sağa sola kaydırmak için slider
-                        dragmode='pan', # Tıklayıp sürükleyince sağa-sola kayar
-                        height=600,
-                        template="plotly_dark",
-                        showlegend=False,
-                        xaxis=dict(range=[df.index[-60], df.index[-1]]) # Başlangıçta son 60 günü göster
-                    )
-                    
-                    # scrollZoom: True -> Mouse tekerleğiyle yakınlaşma/uzaklaşma
-                    st.plotly_chart(fig, use_container_width=True, config={
-                        'scrollZoom': True,
-                        'displayModeBar': True,
-                        'modeBarButtonsToAdd': ['drawline', 'drawopenpath', 'eraseshape']
-                    })
+                    fig_main.update_layout(xaxis_rangeslider_visible=False, height=500, template="plotly_dark", showlegend=False, xaxis=dict(range=[df.index[-60], df.index[-1]]), dragmode='pan')
+                    st.plotly_chart(fig_main, use_container_width=True, config={'scrollZoom': True})
 
                 with col_right:
-                    st.subheader("🔗 Korelasyon")
+                    st.subheader("🔗 İlişki")
                     combined = pd.concat([df['Close'], df_comp['Close']], axis=1).dropna().tail(30)
                     combined.columns = ['Hisse', 'Endeks']
-                    
                     if not combined.empty:
-                        p_corr = combined['Hisse'].corr(combined['Kiyas'], method='pearson') if 'Kiyas' in combined else combined['Hisse'].corr(combined['Endeks'])
-                        st.metric(f"{symbol_raw} vs {compare_raw}", f"{p_corr:.2f}")
+                        st.metric(f"Pearson ({symbol_raw})", f"{combined['Hisse'].corr(combined['Endeks']):.2f}")
+                        st.write(f"**Amihud (30G Ort):** {df['Amihud'].tail(30).mean():.4f}")
                         st.write(f"**Günlük Range Ort:** {df['Daily Range'].tail(30).mean():.2f}")
-                        st.write(f"**Amihud Ort:** {df['Amihud'].tail(30).mean():.4f}")
 
                 # --- 2. TABLO ---
                 st.divider()
-                st.subheader("📅 Detay Veri Listesi")
-                
-                def color_sign(val):
-                    if val > 0: return f"🟢 +%{val:.2f}"
-                    if val < 0: return f"🔴 -%{abs(val):.2f}"
-                    return "⚪ 0.00"
-
+                st.subheader(f"📅 {symbol_raw} Detay Veri Listesi")
                 res_df = df.tail(30).copy()
-                res_df['Değişim %'] = res_df['Pct_Change'].apply(color_sign)
+                res_df['Değişim %'] = (res_df['Pct_Change']).apply(lambda x: f"🟢 +%{x:.2f}" if x > 0 else f"🔴 -%{abs(x):.2f}" if x < 0 else "⚪ 0.00")
                 
-                # Volume yanında Daily Range ve Amihud
                 table_final = res_df[['Open', 'High', 'Low', 'Close', 'Volume', 'Daily Range', 'Amihud', 'Değişim %']].sort_index(ascending=False)
-                st.dataframe(table_final, use_container_width=True, height=500)
+                st.dataframe(table_final, use_container_width=True, height=400)
+
+                # --- 3. YENİ: DUAL AXIS LİKİDİTE VE VOLATİLİTE GRAFİĞİ ---
+                st.subheader(f"📉 {symbol_raw} Amihud vs Daily Range Analizi (Trend)")
+                
+                plot_data = df.tail(30) # Son 30 günün verisi
+                
+                fig_dual = go.Figure()
+
+                # Amihud - Sol Eksen (Y1)
+                fig_dual.add_trace(go.Scatter(
+                    x=plot_data.index, y=plot_data['Amihud'],
+                    name="Amihud (Likidite Eksikliği)",
+                    line=dict(color='#00FFCC', width=3),
+                    yaxis="y1"
+                ))
+
+                # Daily Range - Sağ Eksen (Y2)
+                fig_dual.add_trace(go.Scatter(
+                    x=plot_data.index, y=plot_data['Daily Range'],
+                    name="Daily Range (Volatilite)",
+                    line=dict(color='#FFD700', width=3, dash='dot'),
+                    yaxis="y2"
+                ))
+
+                # Eksen Ayarları
+                fig_dual.update_layout(
+                    template="plotly_dark",
+                    height=500,
+                    xaxis=dict(title="Tarih"),
+                    yaxis=dict(title="<b>Amihud</b> (Sol)", titlefont=dict(color="#00FFCC"), tickfont=dict(color="#00FFCC")),
+                    yaxis2=dict(title="<b>Daily Range</b> (Sağ)", titlefont=dict(color="#FFD700"), tickfont=dict(color="#FFD700"), anchor="x", overlaying="y", side="right"),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                    margin=dict(l=50, r=50, t=80, b=50),
+                    hovermode="x unified"
+                )
+
+                st.plotly_chart(fig_dual, use_container_width=True)
+
+else:
+    st.info("👈 Analizi başlatmak için sol menüden sembol girin.")
