@@ -199,10 +199,11 @@ with st.sidebar:
     st.markdown("---")
     auto_refresh = st.checkbox("🔄 Otomatik Yenile (55s)", value=False)
     if auto_refresh:
-        import time
         st.markdown(f"<span style='color:#6b7280;font-size:0.8em'>Son: {datetime.now().strftime('%H:%M:%S')}</span>", unsafe_allow_html=True)
-        time.sleep(55)
-        st.rerun()
+        st.components.v1.html(
+            "<script>setTimeout(function(){window.location.reload();}, 55000);</script>",
+            height=0
+        )
 
 # ── Ana Alan ─────────────────────────────────────────────────────────────────
 st.markdown("# 📈 BIST30 Günlük Analiz Tablosu")
