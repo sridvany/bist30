@@ -164,7 +164,7 @@ with st.sidebar:
     st.markdown("---")
     secondary_metric = st.radio(
         "📉 Grafik İkinci Eksen",
-        options=["Daily Range (%)", "Amihud (×10⁶)"],
+        options=["Daily Range (%)", "Amihud (×10⁶)", "Hacim"],
         index=0,
     )
 
@@ -264,6 +264,14 @@ if run or "last_ticker" in st.session_state:
                 name="log₁₀(Amihud)",
                 line=dict(color="#f59e0b", width=1.2),
             ), secondary_y=True)
+        elif sec_col == "Hacim":
+            log_hacim = np.log10(metrics["Hacim"].replace(0, np.nan).dropna())
+            fig.add_trace(go.Scatter(
+                x=log_hacim.index,
+                y=log_hacim.values,
+                name="log₁₀(Hacim)",
+                line=dict(color="#7dd3fc", width=1.2),
+            ), secondary_y=True)
         else:
             window = min(30, len(sec_data))
             trend_vals = []
@@ -319,7 +327,7 @@ if run or "last_ticker" in st.session_state:
             secondary_y=False,
         )
         fig.update_yaxes(
-            title_text="log₁₀(Amihud)" if sec_col == "Amihud (×10⁶)" else sec_col,
+            title_text="log₁₀(Amihud)" if sec_col == "Amihud (×10⁶)" else ("log₁₀(Hacim)" if sec_col == "Hacim" else sec_col),
             title_font=dict(color="#7dd3fc"),
             tickfont=dict(color="#7dd3fc"),
             showgrid=False,
