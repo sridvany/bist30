@@ -107,7 +107,7 @@ def fetch_oldest_date(ticker: str) -> str:
 
 
 def compute_metrics(df: pd.DataFrame) -> pd.DataFrame:
-    """Günlük kapanış, güniçi değişim, Amihud, Daily Range hesapla."""
+    """Günlük kapanış, güniçi değişim, Amihud, Daily Range, Corwin-Schultz, MEC hesapla."""
     out = pd.DataFrame(index=df.index)
     out["Kapanış (₺)"]     = df["Close"].round(2)
     out["Açılış (₺)"]      = df["Open"].round(2)
@@ -126,11 +126,45 @@ def compute_metrics(df: pd.DataFrame) -> pd.DataFrame:
 
     out["log₁₀(Hacim)"] = np.log10(df["Volume"].replace(0, np.nan))
 
-    amihud = out["Amihud (×10⁶)"].copy()
+    # ── Corwin-Schultz Bid-Ask Spread ────────────────────────────────────────
+    h = np.log(df["High"])
+    l = np.log(df["Low"])
+    h2 = np.log(df["High"].combine(df["High"].shift(-1), max))
+    l2 = np.log(df["Low"].combine(df["Low"].shift(-1), min))
+
+    beta  = (h - l) ** 2 + (h.shift(-1) - l.shift(-1)) ** 2
+    gamma = (h2 - l2) ** 2
+    k     = 3 - 2 * np.sqrt(2)
+    alpha = (np.sqrt(2 * beta) - np.sqrt(beta)) / k - np.sqrt(gamma / k)
+    alpha = alpha.clip(lower=0)
+    cs    = 2 * (np.exp(alpha) - 1) / (1 + np.exp(alpha))
+    out["C-S Spread (%)"] = (cs * 100).round(4)
+
+    # ── MEC (Market Efficiency Coefficient) — 90 günlük rolling ─────────────
+    log_ret = np.log(df["Close"] / df["Close"].shift(1))
+    window  = 90
+    mec_vals = []
+    for i in range(len(df)):
+        if i < window:
+            mec_vals.append(np.nan)
+            continue
+        seg = log_ret.iloc[i - window + 1: i + 1]
+        # 30-günlük log return: her 6. gün kapanış farkı
+        lr30 = np.log(df["Close"].iloc[i - window + 1: i + 1].values[::6])
+        r30  = np.diff(lr30)
+        # 5-günlük log return: her gün kapanış farkı (1 adım = ~1 gün)
+        r5   = seg.values
+        var30 = np.var(r30, ddof=1) if len(r30) > 1 else np.nan
+        var5  = np.var(r5,  ddof=1) if len(r5)  > 1 else np.nan
+        denom = 6 * var5
+        mec_vals.append(round(var30 / denom, 4) if denom and denom > 0 else np.nan)
+    out["MEC"] = mec_vals
+
+    amihud   = out["Amihud (×10⁶)"].copy()
     log_hacim = out["log₁₀(Hacim)"].copy()
     out = out.round(4)
-    out["Amihud (×10⁶)"] = amihud
-    out["log₁₀(Hacim)"] = log_hacim.round(4)
+    out["Amihud (×10⁶)"]  = amihud
+    out["log₁₀(Hacim)"]   = log_hacim.round(4)
     return out
 
 def color_val(val, col):
@@ -140,6 +174,11 @@ def color_val(val, col):
         cls = "pos" if val > 0 else ("neg" if val < 0 else "neutral")
         sign = "+" if val > 0 else ""
         return f'<span class="{cls}">{sign}{val:.2f}%</span>'
+    if col == "C-S Spread (%)":
+        return f'<span class="neutral">{val:.4f}%</span>'
+    if col == "MEC":
+        cls = "pos" if val <= 1.0 else "neg"
+        return f'<span class="{cls}">{val:.4f}</span>'
     if col == "log₁₀(Hacim)":
         return f'<span class="neutral">{val:.4f}</span>'
     if col == "Amihud (×10⁶)":
@@ -182,7 +221,13 @@ with st.sidebar:
     st.markdown("---")
     secondary_metric = st.radio(
         "📉 Likidite Boyutları",
-        options=["Daily Range (%) — Anındalık", "Amihud (×10⁶) — Genişlik", "Hacim — Derinlik"],
+        options=[
+            "Daily Range (%) — Anındalık",
+            "Amihud (×10⁶) — Genişlik",
+            "Hacim — Derinlik",
+            "C-S Spread (%) — Sıkılık",
+            "MEC — Esneklik",
+        ],
         index=0,
     )
     # Radio değerinden asıl sütun adını çıkar
@@ -208,6 +253,21 @@ Yüksek = büyük fiyat etkisi = az likit.
 Günlük toplam işlem adedi (log₁₀ normalize).
 Düşük hacim zayıf likidite koşullarına işaret eder.
 Yüksek = derin piyasa = büyük emirler fiyatı az etkiler.
+
+---
+
+**📊 Corwin-Schultz (2012) — Sıkılık**
+Günlük yüksek/düşük fiyat oranından tahmin edilen bid-ask spread.
+Saf işlem maliyetini temsil eder; örtülü maliyetler dahil değildir.
+Düşük spread = daha iyi likidite koşulları.
+
+---
+
+**📊 MEC — Esneklik**
+Haftalık getiri varyansının günlük getiri varyansına oranı (90 günlük rolling).
+Piyasanın yeni dengesine ne kadar hızlı döndüğünü ölçer.
+MEC ≈ 1 veya < 1 → piyasa dayanıklı (resilient).
+MEC > 1 → fiyat yeni dengeye yavaş dönüyor = düşük esneklik.
         """)
 
     st.markdown("---")
@@ -314,6 +374,21 @@ if run or "last_ticker" in st.session_state:
                 name="log₁₀(Hacim)",
                 line=dict(color="#7dd3fc", width=1.2),
             ), secondary_y=True)
+        elif sec_col == "C-S Spread (%)":
+            fig.add_trace(go.Scatter(
+                x=sec_data.index,
+                y=sec_data.values,
+                name="C-S Spread (%)",
+                line=dict(color="#a78bfa", width=1.2),
+            ), secondary_y=True)
+        elif sec_col == "MEC":
+            fig.add_trace(go.Scatter(
+                x=sec_data.index,
+                y=sec_data.values,
+                name="MEC",
+                line=dict(color="#fb923c", width=1.2),
+            ), secondary_y=True)
+            fig.add_hline(y=1.0, line=dict(color="#6b7280", dash="dot", width=1), secondary_y=True)
         else:
             window = min(30, len(sec_data))
             trend_vals = []
@@ -369,7 +444,13 @@ if run or "last_ticker" in st.session_state:
             secondary_y=False,
         )
         fig.update_yaxes(
-            title_text="log₁₀(Amihud)" if sec_col == "Amihud (×10⁶)" else ("log₁₀(Hacim)" if sec_col == "Hacim" else sec_col),
+            title_text=(
+                "log₁₀(Amihud)" if sec_col == "Amihud (×10⁶)" else
+                "log₁₀(Hacim)"  if sec_col == "Hacim" else
+                "C-S Spread (%)" if sec_col == "C-S Spread (%)" else
+                "MEC"            if sec_col == "MEC" else
+                sec_col
+            ),
             title_font=dict(color="#7dd3fc"),
             tickfont=dict(color="#7dd3fc"),
             showgrid=False,
@@ -384,7 +465,8 @@ if run or "last_ticker" in st.session_state:
         cols_show = [
             "Kapanış (₺)", "Açılış (₺)", "Yüksek (₺)", "Düşük (₺)",
             "Hacim", "Günlük Değ. (%)", "Güniçi Değ. (%)",
-            "Daily Range (₺)", "Daily Range (%)", "Amihud (×10⁶)", "log₁₀(Hacim)"
+            "Daily Range (₺)", "Daily Range (%)", "Amihud (×10⁶)", "log₁₀(Hacim)",
+            "C-S Spread (%)", "MEC"
         ]
 
         st.markdown(
