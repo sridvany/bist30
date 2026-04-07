@@ -504,6 +504,28 @@ if run or "last_ticker" in st.session_state:
             line=dict(color="#22c55e", width=1.5),
         ), secondary_y=False)
 
+        # Artış / Düşüş günü noktaları (önceki kapanışa göre)
+        up_mask   = metrics["Günlük Değ. (%)"] > 0
+        down_mask = metrics["Günlük Değ. (%)"] < 0
+        fig.add_trace(go.Scatter(
+            x=metrics.index[up_mask],
+            y=metrics["Kapanış (₺)"][up_mask],
+            mode="markers",
+            name="Artış Günü",
+            marker=dict(color="#22c55e", size=4, symbol="circle"),
+            hovertemplate="%{x}<br>Kapanış: %{y}<br>Değ: +%{customdata:.2f}%<extra></extra>",
+            customdata=metrics["Günlük Değ. (%)"][up_mask],
+        ), secondary_y=False)
+        fig.add_trace(go.Scatter(
+            x=metrics.index[down_mask],
+            y=metrics["Kapanış (₺)"][down_mask],
+            mode="markers",
+            name="Düşüş Günü",
+            marker=dict(color="#ef4444", size=4, symbol="circle"),
+            hovertemplate="%{x}<br>Kapanış: %{y}<br>Değ: %{customdata:.2f}%<extra></extra>",
+            customdata=metrics["Günlük Değ. (%)"][down_mask],
+        ), secondary_y=False)
+
         sec_col  = _secondary
         sec_data = metrics[sec_col].dropna()
 
