@@ -225,31 +225,25 @@ def compute_metrics(df: pd.DataFrame) -> pd.DataFrame:
     out["C-S Spread (%)"] = (cs * 100).round(4)
 
     # ── MEC (Market Efficiency Coefficient) — 90 günlük rolling ─────────────
-    # FIX 4: [::6] yerine resample('W-FRI') ile gerçek haftalık kapanış alınır
-    log_ret    = np.log(df["Close"] / df["Close"].shift(1))
-    weekly_cls = df["Close"].resample("W-FRI").last().dropna()
-    weekly_ret = np.log(weekly_cls / weekly_cls.shift(1)).dropna()
-    window     = 90
-    mec_vals   = []
+    # MEC = 6 × Var(ln(Ct/Ct-5)) / Var(ln(Ct/Ct-30))
+    # Kısa dönem: 5 işlem günü, Uzun dönem: 30 işlem günü, T = 30/5 = 6
+    r5  = np.log(df["Close"] / df["Close"].shift(5))
+    r30 = np.log(df["Close"] / df["Close"].shift(30))
+    window   = 90
+    mec_vals = []
 
     for i in range(len(df)):
         if i < window:
             mec_vals.append(np.nan)
             continue
-        seg_end   = df.index[i]
-        seg_start = df.index[i - window + 1]
+        seg5  = r5.iloc[i - window + 1: i + 1].dropna()
+        seg30 = r30.iloc[i - window + 1: i + 1].dropna()
 
-        r_daily  = log_ret.iloc[i - window + 1: i + 1].dropna()
-        r_weekly = weekly_ret[
-            (weekly_ret.index >= seg_start) & (weekly_ret.index <= seg_end)
-        ]
+        var5  = seg5.var(ddof=1)  if len(seg5)  > 1 else np.nan
+        var30 = seg30.var(ddof=1) if len(seg30) > 1 else np.nan
 
-        var_daily  = r_daily.var(ddof=1)  if len(r_daily)  > 1 else np.nan
-        var_weekly = r_weekly.var(ddof=1) if len(r_weekly) > 1 else np.nan
-
-        denom = 5 * var_daily   # 5 işlem günü = 1 hafta
-        if denom and denom > 0 and pd.notna(var_weekly):
-            mec_vals.append(round(var_weekly / denom, 4))
+        if pd.notna(var30) and var30 > 0 and pd.notna(var5):
+            mec_vals.append(round(6 * var5 / var30, 4))
         else:
             mec_vals.append(np.nan)
 
