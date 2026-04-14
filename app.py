@@ -958,11 +958,12 @@ if run or "last_ticker" in st.session_state:
 
         table_html = f"""
         <style>
-        .data-table {{ width:100%;border-collapse:collapse;font-size:0.82em;margin-top:8px; }}
-        .data-table th {{ background:#1e2235;color:#7dd3fc;font-family:'IBM Plex Mono',monospace;font-weight:600;padding:6px 6px;text-align:right;border-bottom:2px solid #2a2d3e;white-space:nowrap;max-width:90px;overflow:hidden; }}
-        .data-table th:first-child {{ text-align:left;max-width:80px; }}
-        .data-table td {{ padding:5px 6px;text-align:right;border-bottom:1px solid #1e2235;white-space:nowrap;max-width:90px;overflow:hidden; }}
-        .data-table td:first-child {{ text-align:left;max-width:80px; }}
+        .data-table {{ width:100%;border-collapse:collapse;font-size:0.82em;margin-top:8px;table-layout:fixed; }}
+        .data-table th {{ background:#1e2235;color:#7dd3fc;font-family:'IBM Plex Mono',monospace;font-weight:600;padding:6px 4px;text-align:right;border-bottom:2px solid #2a2d3e;overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }}
+        .data-table th:first-child {{ text-align:left;width:80px; }}
+        .data-table th:not(:first-child) {{ width:90px; }}
+        .data-table td {{ padding:5px 4px;text-align:right;border-bottom:1px solid #1e2235;overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }}
+        .data-table td:first-child {{ text-align:left; }}
         .data-table tr:hover td {{ background:#141824; }}
         </style>
         <div style="overflow-x:auto;max-height:65vh;overflow-y:auto;">
