@@ -307,7 +307,7 @@ with st.sidebar:
         st.markdown("**📅 Başlangıç Tarihi**")
         start_date = st.date_input(
             "Başlangıç",
-            value=date(2020, 1, 1),
+            value=date(2000, 1, 1),
             min_value=date(1990, 1, 1),
             max_value=date.today(),
             label_visibility="collapsed"
@@ -403,7 +403,9 @@ MEC > 1 → fiyat yeni dengeye yavaş dönüyor = düşük esneklik.
     st.markdown("---")
     auto_refresh = st.checkbox("🔄 Otomatik Yenile (55s)", value=False)
     if auto_refresh:
-        st.markdown(f"<span style='color:#6b7280;font-size:0.8em'>Son: {datetime.now().strftime('%H:%M:%S')}</span>", unsafe_allow_html=True)
+        import pytz
+        tz_tr = pytz.timezone("Europe/Istanbul")
+        st.markdown(f"<span style='color:#6b7280;font-size:0.8em'>Son: {datetime.now(tz_tr).strftime('%H:%M:%S')}</span>", unsafe_allow_html=True)
         st.components.v1.html(
             "<script>setTimeout(function(){window.location.reload();}, 55000);</script>",
             height=0
