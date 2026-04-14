@@ -644,10 +644,11 @@ if run or "last_ticker" in st.session_state:
 
             tbl_html = f"""
             <style>
-            .data-table {{ width:100%;border-collapse:collapse;font-size:0.82em;margin-top:8px; }}
-            .data-table th {{ background:#1e2235;color:#7dd3fc;font-family:'IBM Plex Mono',monospace;font-weight:600;padding:10px 12px;text-align:right;border-bottom:2px solid #2a2d3e;white-space:nowrap; }}
-            .data-table th:first-child {{ text-align:left; }}
-            .data-table td {{ padding:8px 12px;text-align:right;border-bottom:1px solid #1e2235; }}
+            .data-table {{ width:auto;border-collapse:collapse;font-size:0.82em;margin-top:8px;table-layout:fixed; }}
+            .data-table th {{ background:#1e2235;color:#7dd3fc;font-family:'IBM Plex Mono',monospace;font-weight:600;padding:6px 4px;text-align:right;border-bottom:2px solid #2a2d3e;white-space:nowrap;overflow:hidden;text-overflow:ellipsis; }}
+            .data-table th:first-child {{ text-align:left;width:60px; }}
+            .data-table th:not(:first-child) {{ width:90px; }}
+            .data-table td {{ padding:5px 4px;text-align:right;border-bottom:1px solid #1e2235;overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }}
             .data-table td:first-child {{ text-align:left; }}
             .data-table tr:hover td {{ background:#141824; }}
             </style>
@@ -958,10 +959,10 @@ if run or "last_ticker" in st.session_state:
 
         table_html = f"""
         <style>
-        .data-table {{ width:100%;border-collapse:collapse;font-size:0.82em;margin-top:8px;table-layout:fixed; }}
+        .data-table {{ width:auto;border-collapse:collapse;font-size:0.82em;margin-top:8px;table-layout:fixed; }}
         .data-table th {{ background:#1e2235;color:#7dd3fc;font-family:'IBM Plex Mono',monospace;font-weight:600;padding:6px 4px;text-align:right;border-bottom:2px solid #2a2d3e;overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }}
         .data-table th:first-child {{ text-align:left;width:80px; }}
-        .data-table th:not(:first-child) {{ width:70px; }}
+        .data-table th:not(:first-child) {{ width:90px; }}
         .data-table td {{ padding:5px 4px;text-align:right;border-bottom:1px solid #1e2235;overflow:hidden;text-overflow:ellipsis;white-space:nowrap; }}
         .data-table td:first-child {{ text-align:left; }}
         .data-table tr:hover td {{ background:#141824; }}
