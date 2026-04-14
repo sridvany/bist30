@@ -3,6 +3,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 from datetime import datetime, date
+from scipy.stats import spearmanr          # FIX 2: dosya başına taşındı
 import warnings
 from plotly.subplots import make_subplots
 import plotly.graph_objects as go
@@ -96,12 +97,18 @@ def fetch_live(ticker: str) -> pd.Series | None:
 
 @st.cache_data(ttl=3600, show_spinner=False, persist=False)
 def fetch_oldest_date(ticker: str) -> str:
-    """Hissenin gerçek en eski veri tarihini döndür."""
+    # FIX 3: fast_info ile hafif sorgu; tüm tarih geçmişini çekmekten kaçınır
     try:
-        df = yf.download(ticker, start="1990-01-01", auto_adjust=True, progress=False)
-        if df.empty:
-            return "—"
-        return df.index.min().strftime("%d.%m.%Y")
+        t = yf.Ticker(ticker)
+        epoch = t.fast_info.get("firstTradeDateEpochUtc", None)
+        if epoch is not None:
+            return pd.Timestamp(epoch, unit="s").strftime("%d.%m.%Y")
+        # fast_info desteklemiyorsa minimal fallback
+        df = yf.download(ticker, start="1990-01-01", end="1990-12-31",
+                         auto_adjust=True, progress=False)
+        if not df.empty:
+            return df.index.min().strftime("%d.%m.%Y")
+        return "—"
     except Exception:
         return "—"
 
@@ -148,18 +155,13 @@ def compute_intraday_metrics(df: pd.DataFrame, df_60d: pd.DataFrame) -> pd.DataF
     out["Düşük"]          = df["Low"].round(4)
     out["Hacim"]          = df["Volume"].astype(int)
 
-    # Bar değişimi (önceki bara göre %)
     out["Değişim (%)"]    = df["Close"].pct_change() * 100
-
-    # Daily Range (2dk bar)
     out["Bar Range (%)"]  = ((df["High"] - df["Low"]) / df["Low"] * 100).round(4)
 
-    # Amihud (2dk)
     bar_return = df["Close"].pct_change().abs()
     tl_vol     = df["Close"] * df["Volume"]
     out["Amihud (2dk)"]   = (bar_return / tl_vol * 1e6).replace([np.inf, -np.inf], np.nan)
 
-    # C-S Spread (2dk)
     h = np.log(df["High"])
     l = np.log(df["Low"])
     h2 = np.log(df["High"].combine(df["High"].shift(-1), max))
@@ -172,7 +174,6 @@ def compute_intraday_metrics(df: pd.DataFrame, df_60d: pd.DataFrame) -> pd.DataF
     cs    = 2 * (np.exp(alpha) - 1) / (1 + np.exp(alpha))
     out["C-S Spread (%)"] = (cs * 100).round(4)
 
-    # RVOL — aynı zaman diliminin 60 günlük ortalaması
     if not df_60d.empty:
         df_60d = df_60d.copy()
         df_60d["time_key"] = df_60d.index.strftime("%H:%M")
@@ -224,30 +225,41 @@ def compute_metrics(df: pd.DataFrame) -> pd.DataFrame:
     out["C-S Spread (%)"] = (cs * 100).round(4)
 
     # ── MEC (Market Efficiency Coefficient) — 90 günlük rolling ─────────────
-    log_ret = np.log(df["Close"] / df["Close"].shift(1))
-    window  = 90
-    mec_vals = []
+    # FIX 4: [::6] yerine resample('W-FRI') ile gerçek haftalık kapanış alınır
+    log_ret    = np.log(df["Close"] / df["Close"].shift(1))
+    weekly_cls = df["Close"].resample("W-FRI").last().dropna()
+    weekly_ret = np.log(weekly_cls / weekly_cls.shift(1)).dropna()
+    window     = 90
+    mec_vals   = []
+
     for i in range(len(df)):
         if i < window:
             mec_vals.append(np.nan)
             continue
-        seg = log_ret.iloc[i - window + 1: i + 1]
-        # 30-günlük log return: her 6. gün kapanış farkı
-        lr30 = np.log(df["Close"].iloc[i - window + 1: i + 1].values[::6])
-        r30  = np.diff(lr30)
-        # 5-günlük log return: her gün kapanış farkı (1 adım = ~1 gün)
-        r5   = seg.values
-        var30 = np.var(r30, ddof=1) if len(r30) > 1 else np.nan
-        var5  = np.var(r5,  ddof=1) if len(r5)  > 1 else np.nan
-        denom = 6 * var5
-        mec_vals.append(round(var30 / denom, 4) if denom and denom > 0 else np.nan)
+        seg_end   = df.index[i]
+        seg_start = df.index[i - window + 1]
+
+        r_daily  = log_ret.iloc[i - window + 1: i + 1].dropna()
+        r_weekly = weekly_ret[
+            (weekly_ret.index >= seg_start) & (weekly_ret.index <= seg_end)
+        ]
+
+        var_daily  = r_daily.var(ddof=1)  if len(r_daily)  > 1 else np.nan
+        var_weekly = r_weekly.var(ddof=1) if len(r_weekly) > 1 else np.nan
+
+        denom = 5 * var_daily   # 5 işlem günü = 1 hafta
+        if denom and denom > 0 and pd.notna(var_weekly):
+            mec_vals.append(round(var_weekly / denom, 4))
+        else:
+            mec_vals.append(np.nan)
+
     out["MEC"] = mec_vals
 
-    amihud   = out["Amihud (×10⁶)"].copy()
+    amihud    = out["Amihud (×10⁶)"].copy()
     log_hacim = out["log₁₀(Hacim)"].copy()
     out = out.round(4)
-    out["Amihud (×10⁶)"]  = amihud
-    out["log₁₀(Hacim)"]   = log_hacim.round(4)
+    out["Amihud (×10⁶)"] = amihud
+    out["log₁₀(Hacim)"]  = log_hacim.round(4)
     return out
 
 def color_val(val, col):
@@ -332,7 +344,6 @@ with st.sidebar:
         ],
         index=0,
     )
-    # Radio değerinden asıl sütun adını çıkar
     secondary_metric = secondary_metric.split(" — ")[0]
 
     with st.expander("📖 Boyut Tanımları"):
@@ -433,7 +444,6 @@ if run or "last_ticker" in st.session_state:
             st.markdown(f"### ⏱️ {_ticker} — {pd.Timestamp(sel_date).strftime('%d.%m.%Y')} Güniçi Analiz")
             intra = compute_intraday_metrics(df_day, df_60d)
 
-            # ── Özet kartlar ────────────────────────────────────────────────
             open_p  = df_day["Open"].iloc[0]
             close_p = df_day["Close"].iloc[-1]
             high_p  = df_day["High"].max()
@@ -449,44 +459,38 @@ if run or "last_ticker" in st.session_state:
             k5.metric("Günlük Range", f"{((high_p - low_p) / low_p * 100):.2f}%")
             st.markdown("---")
 
-            # ── Güniçi Yorum ─────────────────────────────────────────────────
             def intraday_yorum(intra: pd.DataFrame, ticker: str, sel_date: str) -> None:
                 if intra.empty or len(intra) < 5:
                     return
 
-                # En likit / en az likit 3 bar (RVOL'e göre)
                 rvol_valid = intra["RVOL"].dropna()
                 if len(rvol_valid) >= 3:
                     top3_likit    = rvol_valid.nlargest(3)
                     bottom3_likit = rvol_valid.nsmallest(3)
 
-                # Güniçi dilimler (sabah / öğle / kapanış)
                 times = intra.index
                 sabah   = intra[times.hour < 11]
                 ogle    = intra[(times.hour >= 11) & (times.hour < 14)]
                 kapanis = intra[times.hour >= 14]
 
                 def dilim_rvol(d): return d["RVOL"].mean() if not d.empty and d["RVOL"].notna().any() else np.nan
-                def dilim_range(d): return d["Bar Range (%)"].mean() if not d.empty else np.nan
 
                 sabah_rvol   = dilim_rvol(sabah)
                 ogle_rvol    = dilim_rvol(ogle)
                 kapanis_rvol = dilim_rvol(kapanis)
 
-                # Genel RVOL durumu
-                rvol_ort = intra["RVOL"].mean()
+                rvol_ort   = intra["RVOL"].mean()
                 amihud_ort = intra["Amihud (2dk)"].mean()
-                cs_valid = intra[intra["C-S Spread (%)"] > 0]["C-S Spread (%)"]
-                cs_ort   = cs_valid.mean() if not cs_valid.empty else np.nan
+                cs_valid   = intra[intra["C-S Spread (%)"] > 0]["C-S Spread (%)"]
+                cs_ort     = cs_valid.mean() if not cs_valid.empty else np.nan
 
-                # Sinyal
                 sinyaller = {}
                 if pd.notna(rvol_ort):
-                    sinyaller["RVOL"]    = "iyi" if rvol_ort >= 1.2 else ("kötü" if rvol_ort < 0.8 else "nötr")
+                    sinyaller["RVOL"]   = "iyi" if rvol_ort >= 1.2 else ("kötü" if rvol_ort < 0.8 else "nötr")
                 if pd.notna(amihud_ort):
-                    sinyaller["Amihud"]  = "kötü" if amihud_ort > intra["Amihud (2dk)"].quantile(0.75) else "iyi"
+                    sinyaller["Amihud"] = "kötü" if amihud_ort > intra["Amihud (2dk)"].quantile(0.75) else "iyi"
                 if pd.notna(cs_ort):
-                    sinyaller["C-S"]     = "kötü" if cs_ort > cs_valid.quantile(0.75) else "iyi"
+                    sinyaller["C-S"]    = "kötü" if cs_ort > cs_valid.quantile(0.75) else "iyi"
 
                 kotu = sum(1 for s in sinyaller.values() if s == "kötü")
                 iyi  = sum(1 for s in sinyaller.values() if s == "iyi")
@@ -499,10 +503,8 @@ if run or "last_ticker" in st.session_state:
                         genel, renk, ikon = "Yüksek Likidite", "#22c55e", "🟢"
                     else:
                         genel, renk, ikon = "Orta Likidite", "#f59e0b", "🟡"
-
                     st.markdown(f"### {ikon} Güniçi Likidite: <span style='color:{renk}'>{genel}</span>", unsafe_allow_html=True)
 
-                # Dilim kartları
                 d1, d2, d3 = st.columns(3)
                 for col_w, ad, rv in [(d1, "🌅 Sabah (<11:00)", sabah_rvol),
                                        (d2, "☀️ Öğle (11-14)", ogle_rvol),
@@ -516,7 +518,6 @@ if run or "last_ticker" in st.session_state:
                             f"</div>", unsafe_allow_html=True
                         )
 
-                # Metin yorum
                 st.markdown("")
                 paragraf = []
                 if pd.notna(rvol_ort):
@@ -528,14 +529,14 @@ if run or "last_ticker" in st.session_state:
                         paragraf.append(f"Gün genelinde ortalama RVOL **{rvol_ort:.2f}** — normale yakın hacim.")
 
                 if len(rvol_valid) >= 3:
-                    en_yogun = top3_likit.index.strftime("%H:%M").tolist()
+                    en_yogun  = top3_likit.index.strftime("%H:%M").tolist()
                     en_seyrek = bottom3_likit.index.strftime("%H:%M").tolist()
                     paragraf.append(f"En yoğun saatler: **{', '.join(en_yogun)}**. En seyrek saatler: **{', '.join(en_seyrek)}**.")
 
                 dilimleri = [(sabah_rvol, "sabah"), (ogle_rvol, "öğle"), (kapanis_rvol, "kapanış")]
                 gecerli = [(rv, ad) for rv, ad in dilimleri if pd.notna(rv)]
                 if gecerli:
-                    en_iyi = max(gecerli, key=lambda x: x[0])
+                    en_iyi  = max(gecerli, key=lambda x: x[0])
                     en_kotu = min(gecerli, key=lambda x: x[0])
                     if en_iyi[0] != en_kotu[0]:
                         paragraf.append(f"En likit dilim **{en_iyi[1]}** (RVOL: {en_iyi[0]:.2f}), en az likit dilim **{en_kotu[1]}** (RVOL: {en_kotu[0]:.2f}).")
@@ -548,34 +549,22 @@ if run or "last_ticker" in st.session_state:
             intraday_yorum(intra, _ticker, sel_date)
             st.markdown("---")
 
-            # ── Grafik 1: Fiyat + Hacim ──────────────────────────────────────
             fig_i = make_subplots(specs=[[{"secondary_y": True}]])
-
             up_m   = intra["Değişim (%)"] > 0
             down_m = intra["Değişim (%)"] <= 0
 
-            fig_i.add_trace(go.Scatter(
-                x=intra.index, y=intra["Kapanış"],
-                name="Kapanış", line=dict(color="#22c55e", width=1.5),
-            ), secondary_y=False)
-            fig_i.add_trace(go.Scatter(
-                x=intra.index[up_m], y=intra["Kapanış"][up_m],
-                mode="markers", name="Artış",
-                marker=dict(color="#22c55e", size=4),
+            fig_i.add_trace(go.Scatter(x=intra.index, y=intra["Kapanış"],
+                name="Kapanış", line=dict(color="#22c55e", width=1.5)), secondary_y=False)
+            fig_i.add_trace(go.Scatter(x=intra.index[up_m], y=intra["Kapanış"][up_m],
+                mode="markers", name="Artış", marker=dict(color="#22c55e", size=4),
                 customdata=intra["Değişim (%)"][up_m],
-                hovertemplate="%{x}<br>%{y}<br>+%{customdata:.3f}%<extra></extra>",
-            ), secondary_y=False)
-            fig_i.add_trace(go.Scatter(
-                x=intra.index[down_m], y=intra["Kapanış"][down_m],
-                mode="markers", name="Düşüş",
-                marker=dict(color="#ef4444", size=4),
+                hovertemplate="%{x}<br>%{y}<br>+%{customdata:.3f}%<extra></extra>"), secondary_y=False)
+            fig_i.add_trace(go.Scatter(x=intra.index[down_m], y=intra["Kapanış"][down_m],
+                mode="markers", name="Düşüş", marker=dict(color="#ef4444", size=4),
                 customdata=intra["Değişim (%)"][down_m],
-                hovertemplate="%{x}<br>%{y}<br>%{customdata:.3f}%<extra></extra>",
-            ), secondary_y=False)
-            fig_i.add_trace(go.Bar(
-                x=intra.index, y=intra["Hacim"],
-                name="Hacim", marker_color="#7dd3fc", opacity=0.3,
-            ), secondary_y=True)
+                hovertemplate="%{x}<br>%{y}<br>%{customdata:.3f}%<extra></extra>"), secondary_y=False)
+            fig_i.add_trace(go.Bar(x=intra.index, y=intra["Hacim"],
+                name="Hacim", marker_color="#7dd3fc", opacity=0.3), secondary_y=True)
 
             fig_i.update_layout(
                 paper_bgcolor="#0f1117", plot_bgcolor="#0f1117",
@@ -592,26 +581,22 @@ if run or "last_ticker" in st.session_state:
                                tickfont=dict(color="#7dd3fc"), showgrid=False, secondary_y=True)
             st.plotly_chart(fig_i, use_container_width=True, config={"scrollZoom": True, "displayModeBar": True})
 
-            # ── Grafik 2: Likidite Boyutları ──────────────────────────────────
             fig_l = make_subplots(rows=3, cols=1, shared_xaxes=True,
                                   subplot_titles=["RVOL", "Bar Range (%) & C-S Spread (%)", "Amihud (2dk)"],
                                   vertical_spacing=0.08)
 
-            # RVOL
             rvol_colors = ["#22c55e" if v >= 1.2 else ("#ef4444" if v < 0.8 else "#f59e0b")
                            for v in intra["RVOL"].fillna(1.0)]
             fig_l.add_trace(go.Bar(x=intra.index, y=intra["RVOL"],
                                    name="RVOL", marker_color=rvol_colors, opacity=0.8), row=1, col=1)
             fig_l.add_hline(y=1.0, line=dict(color="#6b7280", dash="dot", width=1), row=1, col=1)
 
-            # Bar Range + C-S Spread
             fig_l.add_trace(go.Scatter(x=intra.index, y=intra["Bar Range (%)"],
                                        name="Bar Range (%)", line=dict(color="#7dd3fc", width=1.2)), row=2, col=1)
             cs_plot = intra["C-S Spread (%)"].replace(0, np.nan)
             fig_l.add_trace(go.Scatter(x=intra.index, y=cs_plot,
                                        name="C-S Spread (%)", line=dict(color="#a78bfa", width=1.2)), row=2, col=1)
 
-            # Amihud
             amihud_log = intra["Amihud (2dk)"].apply(
                 lambda x: abs(np.log10(x)) if pd.notna(x) and x > 0 else np.nan)
             fig_l.add_trace(go.Scatter(x=intra.index, y=amihud_log,
@@ -631,7 +616,6 @@ if run or "last_ticker" in st.session_state:
             st.plotly_chart(fig_l, use_container_width=True, config={"scrollZoom": True, "displayModeBar": True})
             st.markdown("---")
 
-            # ── 2dk Tablo ────────────────────────────────────────────────────
             cols_intra = ["Kapanış", "Açılış", "Yüksek", "Düşük", "Hacim",
                           "Değişim (%)", "Bar Range (%)", "RVOL", "Amihud (2dk)", "C-S Spread (%)"]
             disp_intra = intra[cols_intra].iloc[::-1]
@@ -675,7 +659,7 @@ if run or "last_ticker" in st.session_state:
     # ── Günlük Mod ───────────────────────────────────────────────────────────
     else:
         with st.spinner(f"{_ticker} verisi çekiliyor..."):
-            raw = fetch_data(_ticker, _start)
+            raw  = fetch_data(_ticker, _start)
             live = fetch_live(_ticker)
 
         if live is not None and not raw.empty:
@@ -686,10 +670,12 @@ if run or "last_ticker" in st.session_state:
                 for col in ["Open", "High", "Low", "Close", "Volume"]:
                     raw.at[today_ts, col] = live[col]
 
+        # FIX 1: st.stop() ile NameError riski giderildi
         if raw.empty:
             st.error(f"❌ {_ticker} için veri bulunamadı. Ticker'ı kontrol edin.")
-        else:
-            oldest = fetch_oldest_date(_ticker)
+            st.stop()
+
+        oldest = fetch_oldest_date(_ticker)
         newest = raw.index.max().strftime("%d.%m.%Y")
         total  = len(raw)
 
@@ -709,48 +695,42 @@ if run or "last_ticker" in st.session_state:
         metrics = compute_metrics(raw)
         display = metrics.iloc[::-1].head(n_rows)
 
-        up_days   = metrics[metrics["Güniçi Değ. (%)"] > 0]
-        down_days = metrics[metrics["Güniçi Değ. (%)"] < 0]
-        avg_range_up_tl   = up_days["Daily Range (₺)"].mean()
-        avg_range_down_tl = down_days["Daily Range (₺)"].mean()
-        avg_range_up_pct  = up_days["Daily Range (%)"].mean()
-        avg_range_down_pct= down_days["Daily Range (%)"].mean()
+        up_days    = metrics[metrics["Güniçi Değ. (%)"] > 0]
+        down_days  = metrics[metrics["Güniçi Değ. (%)"] < 0]
+        avg_range_up_tl    = up_days["Daily Range (₺)"].mean()
+        avg_range_down_tl  = down_days["Daily Range (₺)"].mean()
+        avg_range_up_pct   = up_days["Daily Range (%)"].mean()
+        avg_range_down_pct = down_days["Daily Range (%)"].mean()
 
         sc1, sc2, sc3, sc4 = st.columns(4)
-        sc1.metric("📗 Artış Günü Ort. Range (₺)",
-                   f"{avg_range_up_tl:.2f}", f"{avg_range_up_pct:.2f}%")
+        sc1.metric("📗 Artış Günü Ort. Range (₺)", f"{avg_range_up_tl:.2f}", f"{avg_range_up_pct:.2f}%")
         sc2.metric("📗 Artış Günü Sayısı", f"{len(up_days):,}")
-        sc3.metric("📕 Düşüş Günü Ort. Range (₺)",
-                   f"{avg_range_down_tl:.2f}", f"{avg_range_down_pct:.2f}%",
-                   delta_color="off")
+        sc3.metric("📕 Düşüş Günü Ort. Range (₺)", f"{avg_range_down_tl:.2f}", f"{avg_range_down_pct:.2f}%", delta_color="off")
         sc4.metric("📕 Düşüş Günü Sayısı", f"{len(down_days):,}")
         st.markdown("---")
 
-        # ── Likidite Yorumu ──────────────────────────────────────────────────
         def likidite_yorum(metrics: pd.DataFrame) -> None:
             m = metrics.dropna(subset=["Daily Range (%)", "Amihud (×10⁶)", "Hacim", "C-S Spread (%)", "MEC"])
             if len(m) < 21:
                 st.info("Yorum için yeterli veri yok (min. 21 gün).")
                 return
 
-            son      = m.iloc[-1]
-            trend_w  = 20  # trend penceresi
+            son     = m.iloc[-1]
+            trend_w = 20
 
-            # ── Percentile hesabı ────────────────────────────────────────────
             def pct(series, val):
                 return round((series < val).mean() * 100, 1)
 
-            dr_pct    = pct(m["Daily Range (%)"],  son["Daily Range (%)"])
-            amihud_v  = abs(np.log10(son["Amihud (×10⁶)"])) if son["Amihud (×10⁶)"] > 0 else np.nan
-            amihud_s  = m["Amihud (×10⁶)"].apply(lambda x: abs(np.log10(x)) if x > 0 else np.nan).dropna()
-            amihud_pct= pct(amihud_s, amihud_v) if amihud_v else 50
-            hacim_pct = pct(m["Hacim"], son["Hacim"])
-            cs_valid  = m[m["C-S Spread (%)"] > 0]["C-S Spread (%)"]
-            cs_son    = cs_valid.iloc[-1] if len(cs_valid) > 0 else None
-            cs_pct    = pct(cs_valid, cs_son) if cs_son is not None else None
-            mec_pct   = pct(m["MEC"].dropna(), son["MEC"]) if pd.notna(son["MEC"]) else None
+            dr_pct     = pct(m["Daily Range (%)"], son["Daily Range (%)"])
+            amihud_v   = abs(np.log10(son["Amihud (×10⁶)"])) if son["Amihud (×10⁶)"] > 0 else np.nan
+            amihud_s   = m["Amihud (×10⁶)"].apply(lambda x: abs(np.log10(x)) if x > 0 else np.nan).dropna()
+            amihud_pct = pct(amihud_s, amihud_v) if amihud_v else 50
+            hacim_pct  = pct(m["Hacim"], son["Hacim"])
+            cs_valid   = m[m["C-S Spread (%)"] > 0]["C-S Spread (%)"]
+            cs_son     = cs_valid.iloc[-1] if len(cs_valid) > 0 else None
+            cs_pct     = pct(cs_valid, cs_son) if cs_son is not None else None
+            mec_pct    = pct(m["MEC"].dropna(), son["MEC"]) if pd.notna(son["MEC"]) else None
 
-            # ── Trend yönü (son 20 gün ortalaması vs önceki 20 gün) ──────────
             def trend(series):
                 s = series.dropna()
                 if len(s) < trend_w * 2:
@@ -763,41 +743,32 @@ if run or "last_ticker" in st.session_state:
             cs_trend     = trend(cs_valid) if len(cs_valid) >= trend_w * 2 else 0
             mec_trend    = trend(m["MEC"].dropna())
 
-            # ── Sinyal üret (iyi/nötr/kötü) ─────────────────────────────────
-            # Amihud, Daily Range, C-S Spread: yüksek = kötü
-            # Hacim: düşük = kötü
-            # MEC: >1 = kötü
             sinyaller = {}
 
-            def sinyal_ters(pct_val, tr):  # yüksek = kötü
-                if pct_val >= 75:   s = "kötü"
-                elif pct_val >= 50: s = "nötr"
-                else:               s = "iyi"
+            def sinyal_ters(pct_val, tr):
+                s = "kötü" if pct_val >= 75 else ("nötr" if pct_val >= 50 else "iyi")
                 t = "↑" if tr > 0 else ("↓" if tr < 0 else "→")
                 return s, t
 
-            def sinyal_duz(pct_val, tr):   # yüksek = iyi
-                if pct_val >= 75:   s = "iyi"
-                elif pct_val >= 50: s = "nötr"
-                else:               s = "kötü"
+            def sinyal_duz(pct_val, tr):
+                s = "iyi" if pct_val >= 75 else ("nötr" if pct_val >= 50 else "kötü")
                 t = "↑" if tr > 0 else ("↓" if tr < 0 else "→")
                 return s, t
 
-            sinyaller["Daily Range"]  = sinyal_ters(dr_pct,     dr_trend)
-            sinyaller["Amihud"]       = sinyal_ters(amihud_pct, amihud_trend)
-            sinyaller["Hacim"]        = sinyal_duz (hacim_pct,  hacim_trend)
+            sinyaller["Daily Range"] = sinyal_ters(dr_pct,     dr_trend)
+            sinyaller["Amihud"]      = sinyal_ters(amihud_pct, amihud_trend)
+            sinyaller["Hacim"]       = sinyal_duz (hacim_pct,  hacim_trend)
             if cs_pct is not None:
-                sinyaller["C-S Spread"] = sinyal_ters(cs_pct,   cs_trend)
+                sinyaller["C-S Spread"] = sinyal_ters(cs_pct, cs_trend)
             if mec_pct is not None:
-                mec_sinyal = "kötü" if son["MEC"] > 1 else ("nötr" if son["MEC"] > 0.8 else "iyi")
+                mec_sinyal   = "kötü" if son["MEC"] > 1 else ("nötr" if son["MEC"] > 0.8 else "iyi")
                 mec_trend_ok = "↑" if mec_trend > 0 else ("↓" if mec_trend < 0 else "→")
                 sinyaller["MEC"] = (mec_sinyal, mec_trend_ok)
 
-            kotu  = sum(1 for s, _ in sinyaller.values() if s == "kötü")
-            iyi   = sum(1 for s, _ in sinyaller.values() if s == "iyi")
+            kotu   = sum(1 for s, _ in sinyaller.values() if s == "kötü")
+            iyi    = sum(1 for s, _ in sinyaller.values() if s == "iyi")
             toplam = len(sinyaller)
 
-            # ── Genel skor ───────────────────────────────────────────────────
             if kotu >= toplam * 0.6:
                 genel, renk, ikon = "Düşük Likidite", "#ef4444", "🔴"
             elif iyi >= toplam * 0.6:
@@ -805,14 +776,13 @@ if run or "last_ticker" in st.session_state:
             else:
                 genel, renk, ikon = "Orta Likidite", "#f59e0b", "🟡"
 
-            # ── Boyut kartları ───────────────────────────────────────────────
-            renk_map = {"iyi": "#22c55e", "nötr": "#94a3b8", "kötü": "#ef4444"}
+            renk_map   = {"iyi": "#22c55e", "nötr": "#94a3b8", "kötü": "#ef4444"}
             etiket_map = {
-                "Daily Range":  ("Anındalık",  f"%{dr_pct:.0f} persentil"),
-                "Amihud":       ("Genişlik",   f"%{amihud_pct:.0f} persentil"),
-                "Hacim":        ("Derinlik",   f"%{hacim_pct:.0f} persentil"),
-                "C-S Spread":   ("Sıkılık",    f"%{cs_pct:.0f} persentil" if cs_pct is not None else "—"),
-                "MEC":          ("Esneklik",   f"MEC = {son['MEC']:.3f}" if pd.notna(son["MEC"]) else "—"),
+                "Daily Range": ("Anındalık", f"%{dr_pct:.0f} persentil"),
+                "Amihud":      ("Genişlik",  f"%{amihud_pct:.0f} persentil"),
+                "Hacim":       ("Derinlik",  f"%{hacim_pct:.0f} persentil"),
+                "C-S Spread":  ("Sıkılık",   f"%{cs_pct:.0f} persentil" if cs_pct is not None else "—"),
+                "MEC":         ("Esneklik",  f"MEC = {son['MEC']:.3f}" if pd.notna(son["MEC"]) else "—"),
             }
 
             st.markdown(f"### {ikon} Likidite Durumu: <span style='color:{renk}'>{genel}</span>", unsafe_allow_html=True)
@@ -830,11 +800,9 @@ if run or "last_ticker" in st.session_state:
                     unsafe_allow_html=True
                 )
 
-            # ── Metin yorumu ─────────────────────────────────────────────────
             st.markdown("")
             paragraf = []
 
-            # Genel durum
             if genel == "Düşük Likidite":
                 paragraf.append(f"**{_ticker}** bugün itibarıyla **düşük likidite** koşullarında işlem görüyor.")
             elif genel == "Yüksek Likidite":
@@ -842,7 +810,6 @@ if run or "last_ticker" in st.session_state:
             else:
                 paragraf.append(f"**{_ticker}** bugün itibarıyla **karma likidite** koşullarında işlem görüyor.")
 
-            # Boyut bazlı yorumlar
             if sinyaller.get("Amihud", ("nötr",))[0] == "kötü" and sinyaller.get("Hacim", ("nötr",))[0] == "kötü":
                 paragraf.append("Fiyat etkisi yüksek, işlem hacmi düşük — büyük emirler ciddi kayma yaratabilir.")
             elif sinyaller.get("Amihud", ("nötr",))[0] == "iyi" and sinyaller.get("Hacim", ("nötr",))[0] == "iyi":
@@ -852,7 +819,7 @@ if run or "last_ticker" in st.session_state:
 
             if sinyaller.get("Daily Range", ("nötr",))[0] == "kötü":
                 paragraf.append(f"Günlük fiyat aralığı tarihsel dağılımın %{dr_pct:.0f}'lik dilimine girmiş; anındalık zayıf.")
-            
+
             if cs_pct is not None and sinyaller.get("C-S Spread", ("nötr",))[0] == "kötü":
                 paragraf.append(f"Bid-ask spread (son geçerli: %{cs_son:.4f}) %{cs_pct:.0f} persentilde — işlem maliyeti yüksek.")
 
@@ -862,9 +829,8 @@ if run or "last_ticker" in st.session_state:
                 else:
                     paragraf.append(f"MEC = {son['MEC']:.3f} (≤1): Fiyat yeni dengesine hızlı dönüyor, piyasa dayanıklı.")
 
-            # Trend özeti
-            kotu_trend  = sum(1 for _, t in sinyaller.values() if t == "↑" and _ == "kötü")
-            iyi_trend   = sum(1 for _, t in sinyaller.values() if t == "↓" and _ == "kötü")
+            kotu_trend = sum(1 for _, t in sinyaller.values() if t == "↑" and _ == "kötü")
+            iyi_trend  = sum(1 for _, t in sinyaller.values() if t == "↓" and _ == "kötü")
             if kotu_trend >= 2:
                 paragraf.append("Son 20 günlük trend likiditenin **kötüleştiğine** işaret ediyor.")
             elif iyi_trend >= 2:
@@ -875,33 +841,25 @@ if run or "last_ticker" in st.session_state:
         likidite_yorum(metrics)
         st.markdown("---")
 
-        # ── Dual-Axis Grafik ─────────────────────────────────────────────────
         fig = make_subplots(specs=[[{"secondary_y": True}]])
 
         fig.add_trace(go.Scatter(
-            x=metrics.index,
-            y=metrics["Kapanış (₺)"],
-            name="Kapanış",
-            line=dict(color="#22c55e", width=1.5),
+            x=metrics.index, y=metrics["Kapanış (₺)"],
+            name="Kapanış", line=dict(color="#22c55e", width=1.5),
         ), secondary_y=False)
 
-        # Artış / Düşüş günü noktaları (önceki kapanışa göre)
         up_mask   = metrics["Günlük Değ. (%)"] > 0
         down_mask = metrics["Günlük Değ. (%)"] < 0
         fig.add_trace(go.Scatter(
-            x=metrics.index[up_mask],
-            y=metrics["Kapanış (₺)"][up_mask],
-            mode="markers",
-            name="Artış Günü",
+            x=metrics.index[up_mask], y=metrics["Kapanış (₺)"][up_mask],
+            mode="markers", name="Artış Günü",
             marker=dict(color="#22c55e", size=4, symbol="circle"),
             hovertemplate="%{x}<br>Kapanış: %{y}<br>Değ: +%{customdata:.2f}%<extra></extra>",
             customdata=metrics["Günlük Değ. (%)"][up_mask],
         ), secondary_y=False)
         fig.add_trace(go.Scatter(
-            x=metrics.index[down_mask],
-            y=metrics["Kapanış (₺)"][down_mask],
-            mode="markers",
-            name="Düşüş Günü",
+            x=metrics.index[down_mask], y=metrics["Kapanış (₺)"][down_mask],
+            mode="markers", name="Düşüş Günü",
             marker=dict(color="#ef4444", size=4, symbol="circle"),
             hovertemplate="%{x}<br>Kapanış: %{y}<br>Değ: %{customdata:.2f}%<extra></extra>",
             customdata=metrics["Günlük Değ. (%)"][down_mask],
@@ -912,34 +870,18 @@ if run or "last_ticker" in st.session_state:
 
         if sec_col == "Amihud (×10⁶)":
             log_amihud = np.log10(sec_data.replace(0, np.nan).dropna()).abs()
-            fig.add_trace(go.Scatter(
-                x=log_amihud.index,
-                y=log_amihud.values,
-                name="log₁₀(Amihud)",
-                line=dict(color="#f59e0b", width=1.2),
-            ), secondary_y=True)
+            fig.add_trace(go.Scatter(x=log_amihud.index, y=log_amihud.values,
+                name="log₁₀(Amihud)", line=dict(color="#f59e0b", width=1.2)), secondary_y=True)
         elif sec_col == "Hacim":
             log_hacim = np.log10(metrics["Hacim"].replace(0, np.nan).dropna())
-            fig.add_trace(go.Scatter(
-                x=log_hacim.index,
-                y=log_hacim.values,
-                name="log₁₀(Hacim)",
-                line=dict(color="#7dd3fc", width=1.2),
-            ), secondary_y=True)
+            fig.add_trace(go.Scatter(x=log_hacim.index, y=log_hacim.values,
+                name="log₁₀(Hacim)", line=dict(color="#7dd3fc", width=1.2)), secondary_y=True)
         elif sec_col == "C-S Spread (%)":
-            fig.add_trace(go.Scatter(
-                x=sec_data.index,
-                y=sec_data.values,
-                name="C-S Spread (%)",
-                line=dict(color="#a78bfa", width=1.2),
-            ), secondary_y=True)
+            fig.add_trace(go.Scatter(x=sec_data.index, y=sec_data.values,
+                name="C-S Spread (%)", line=dict(color="#a78bfa", width=1.2)), secondary_y=True)
         elif sec_col == "MEC":
-            fig.add_trace(go.Scatter(
-                x=sec_data.index,
-                y=sec_data.values,
-                name="MEC",
-                line=dict(color="#fb923c", width=1.2),
-            ), secondary_y=True)
+            fig.add_trace(go.Scatter(x=sec_data.index, y=sec_data.values,
+                name="MEC", line=dict(color="#fb923c", width=1.2)), secondary_y=True)
             fig.add_hline(y=1.0, line=dict(color="#6b7280", dash="dot", width=1), secondary_y=True)
         else:
             window = min(30, len(sec_data))
@@ -953,30 +895,20 @@ if run or "last_ticker" in st.session_state:
                     trend_vals.append(np.poly1d(z)(len(segment) - 1))
                 else:
                     trend_vals.append(segment.iloc[-1])
-            fig.add_trace(go.Scatter(
-                x=sec_data.index,
-                y=trend_vals,
-                name=f"{sec_col} Trend",
-                line=dict(color="#f59e0b", width=1.8),
-            ), secondary_y=True)
+            fig.add_trace(go.Scatter(x=sec_data.index, y=trend_vals,
+                name=f"{sec_col} Trend", line=dict(color="#f59e0b", width=1.8)), secondary_y=True)
 
         fig.update_layout(
-            paper_bgcolor="#0f1117",
-            plot_bgcolor="#0f1117",
+            paper_bgcolor="#0f1117", plot_bgcolor="#0f1117",
             font=dict(family="IBM Plex Mono", color="#94a3b8", size=11),
-            legend=dict(orientation="h", y=1.05, x=0,
-                        bgcolor="rgba(0,0,0,0)", font=dict(size=11)),
-            margin=dict(l=10, r=10, t=40, b=10),
-            height=400,
-            dragmode="pan",
+            legend=dict(orientation="h", y=1.05, x=0, bgcolor="rgba(0,0,0,0)", font=dict(size=11)),
+            margin=dict(l=10, r=10, t=40, b=10), height=400, dragmode="pan",
         )
         fig.update_xaxes(
-            showgrid=False,
-            color="#94a3b8",
+            showgrid=False, color="#94a3b8",
             rangeslider=dict(visible=True, bgcolor="#1e2235", thickness=0.06),
             rangeselector=dict(
-                bgcolor="#1e2235",
-                activecolor="#7dd3fc",
+                bgcolor="#1e2235", activecolor="#7dd3fc",
                 buttons=list([
                     dict(count=1,  label="1M",  step="month", stepmode="backward"),
                     dict(count=3,  label="3M",  step="month", stepmode="backward"),
@@ -987,27 +919,18 @@ if run or "last_ticker" in st.session_state:
                 ])
             ),
         )
-        fig.update_yaxes(
-            title_text="Kapanış",
-            title_font=dict(color="#22c55e"),
-            tickfont=dict(color="#22c55e"),
-            showgrid=True,
-            gridcolor="#1e2235",
-            secondary_y=False,
-        )
+        fig.update_yaxes(title_text="Kapanış", title_font=dict(color="#22c55e"),
+                         tickfont=dict(color="#22c55e"), showgrid=True,
+                         gridcolor="#1e2235", secondary_y=False)
         fig.update_yaxes(
             title_text=(
                 "log₁₀(Amihud)" if sec_col == "Amihud (×10⁶)" else
                 "log₁₀(Hacim)"  if sec_col == "Hacim" else
                 "C-S Spread (%)" if sec_col == "C-S Spread (%)" else
-                "MEC"            if sec_col == "MEC" else
-                sec_col
+                "MEC"            if sec_col == "MEC" else sec_col
             ),
-            title_font=dict(color="#7dd3fc"),
-            tickfont=dict(color="#7dd3fc"),
-            showgrid=False,
-            secondary_y=True,
-            type="linear",
+            title_font=dict(color="#7dd3fc"), tickfont=dict(color="#7dd3fc"),
+            showgrid=False, secondary_y=True, type="linear",
             range=[0, 6] if sec_col == "Daily Range (%)" else None,
         )
 
@@ -1036,55 +959,30 @@ if run or "last_ticker" in st.session_state:
 
         table_html = f"""
         <style>
-        .data-table {{
-            width: 100%;
-            border-collapse: collapse;
-            font-size: 0.82em;
-            margin-top: 8px;
-        }}
-        .data-table th {{
-            background: #1e2235;
-            color: #7dd3fc;
-            font-family: 'IBM Plex Mono', monospace;
-            font-weight: 600;
-            padding: 10px 12px;
-            text-align: right;
-            border-bottom: 2px solid #2a2d3e;
-            white-space: nowrap;
-        }}
-        .data-table th:first-child {{ text-align: left; }}
-        .data-table td {{
-            padding: 8px 12px;
-            text-align: right;
-            border-bottom: 1px solid #1e2235;
-        }}
-        .data-table td:first-child {{ text-align: left; }}
-        .data-table tr:hover td {{ background: #141824; }}
+        .data-table {{ width:100%;border-collapse:collapse;font-size:0.82em;margin-top:8px; }}
+        .data-table th {{ background:#1e2235;color:#7dd3fc;font-family:'IBM Plex Mono',monospace;font-weight:600;padding:10px 12px;text-align:right;border-bottom:2px solid #2a2d3e;white-space:nowrap; }}
+        .data-table th:first-child {{ text-align:left; }}
+        .data-table td {{ padding:8px 12px;text-align:right;border-bottom:1px solid #1e2235; }}
+        .data-table td:first-child {{ text-align:left; }}
+        .data-table tr:hover td {{ background:#141824; }}
         </style>
-        <div style="overflow-x:auto; max-height:65vh; overflow-y:auto;">
-        <table class="data-table">
-        <thead>{header}</thead>
-        <tbody>{rows}</tbody>
-        </table>
-        </div>
-        """
+        <div style="overflow-x:auto;max-height:65vh;overflow-y:auto;">
+        <table class="data-table"><thead>{header}</thead><tbody>{rows}</tbody></table>
+        </div>"""
         st.markdown(table_html, unsafe_allow_html=True)
 
-        # ── İlişki Analizi ───────────────────────────────────────────────────
         st.markdown("---")
         st.markdown("### 🔗 Likidite Boyutları İlişki Analizi")
 
         ana = pd.DataFrame({
-            "Close":         metrics["Kapanış (₺)"],
-            "Daily Range":   metrics["Daily Range (%)"],
-            "Amihud (log)":  metrics["Amihud (×10⁶)"].apply(
+            "Close":        metrics["Kapanış (₺)"],
+            "Daily Range":  metrics["Daily Range (%)"],
+            "Amihud (log)": metrics["Amihud (×10⁶)"].apply(
                 lambda x: abs(np.log10(x)) if pd.notna(x) and x > 0 else np.nan),
-            "Hacim (log)":   metrics["log₁₀(Hacim)"],
-            "C-S Spread":    metrics["C-S Spread (%)"],
-            "MEC":           metrics["MEC"],
+            "Hacim (log)":  metrics["log₁₀(Hacim)"],
+            "C-S Spread":   metrics["C-S Spread (%)"],
+            "MEC":          metrics["MEC"],
         }).dropna()
-
-        from scipy.stats import spearmanr
 
         cols3 = ["Close", "Daily Range", "Amihud (log)", "Hacim (log)", "C-S Spread", "MEC"]
         n = len(cols3)
@@ -1095,20 +993,16 @@ if run or "last_ticker" in st.session_state:
                 corr_matrix[i][j] = round(r, 3)
 
         heat_fig = go.Figure(go.Heatmap(
-            z=corr_matrix,
-            x=cols3, y=cols3,
+            z=corr_matrix, x=cols3, y=cols3,
             colorscale=[[0, "#ef4444"], [0.5, "#1e2235"], [1, "#22c55e"]],
             zmin=-1, zmax=1,
-            text=corr_matrix.round(2),
-            texttemplate="%{text}",
-            textfont=dict(size=12, family="IBM Plex Mono"),
-            showscale=True,
+            text=corr_matrix.round(2), texttemplate="%{text}",
+            textfont=dict(size=12, family="IBM Plex Mono"), showscale=True,
         ))
         heat_fig.update_layout(
             paper_bgcolor="#0f1117", plot_bgcolor="#0f1117",
             font=dict(family="IBM Plex Mono", color="#94a3b8", size=11),
-            margin=dict(l=10, r=10, t=30, b=10),
-            height=380,
+            margin=dict(l=10, r=10, t=30, b=10), height=380,
             title=dict(text="Spearman Korelasyon Matrisi", font=dict(color="#94a3b8", size=12)),
         )
         st.plotly_chart(heat_fig, use_container_width=True)
@@ -1130,18 +1024,14 @@ if run or "last_ticker" in st.session_state:
                 if i >= 10 else np.nan
                 for i in range(len(ana))
             ]
-            roll_fig.add_trace(go.Scatter(
-                x=ana.index, y=roll_corr,
-                name=f"{c1} × {c2}",
-                line=dict(color=color, width=1.5),
-            ))
+            roll_fig.add_trace(go.Scatter(x=ana.index, y=roll_corr,
+                name=f"{c1} × {c2}", line=dict(color=color, width=1.5)))
         roll_fig.add_hline(y=0, line=dict(color="#4b5563", dash="dot", width=1))
         roll_fig.update_layout(
             paper_bgcolor="#0f1117", plot_bgcolor="#0f1117",
             font=dict(family="IBM Plex Mono", color="#94a3b8", size=11),
             legend=dict(orientation="h", y=1.1, bgcolor="rgba(0,0,0,0)"),
-            margin=dict(l=10, r=10, t=30, b=10),
-            height=300,
+            margin=dict(l=10, r=10, t=30, b=10), height=300,
             yaxis=dict(range=[-1, 1], showgrid=True, gridcolor="#1e2235"),
             xaxis=dict(showgrid=False),
         )
@@ -1154,18 +1044,13 @@ if run or "last_ticker" in st.session_state:
         reg_fig = go.Figure()
         for rejim, color, dash in [("Yüksek Vol.", "#ef4444", "solid"), ("Düşük Vol.", "#22c55e", "solid")]:
             mask = ana["Rejim"] == rejim
-            reg_fig.add_trace(go.Scatter(
-                x=ana.index[mask], y=ana["Close"][mask],
-                mode="markers",
-                name=rejim,
-                marker=dict(color=color, size=3, opacity=0.6),
-            ))
+            reg_fig.add_trace(go.Scatter(x=ana.index[mask], y=ana["Close"][mask],
+                mode="markers", name=rejim, marker=dict(color=color, size=3, opacity=0.6)))
         reg_fig.update_layout(
             paper_bgcolor="#0f1117", plot_bgcolor="#0f1117",
             font=dict(family="IBM Plex Mono", color="#94a3b8", size=11),
             legend=dict(orientation="h", y=1.1, bgcolor="rgba(0,0,0,0)"),
-            margin=dict(l=10, r=10, t=30, b=10),
-            height=300,
+            margin=dict(l=10, r=10, t=30, b=10), height=300,
             yaxis=dict(title="Kapanış", showgrid=True, gridcolor="#1e2235"),
             xaxis=dict(showgrid=False),
         )
@@ -1196,5 +1081,5 @@ else:
     | **Günlük Değ. (%)** | Önceki kapanışa göre değişim |
     | **Güniçi Değ. (%)** | (Kapanış − Açılış) / Açılış × 100 |
     | **Daily Range (₺)** | Yüksek − Düşük (mutlak fark) |
-    | **Amihud (×10⁶)** | \|Getiri\| / Hacim × 10⁶ — düşük = likit |
+    | **Amihud (×10⁶)** | |Getiri| / Hacim × 10⁶ — düşük = likit |
     """)
