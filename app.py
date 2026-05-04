@@ -200,6 +200,230 @@ def compute_intraday_metrics(df: pd.DataFrame, df_60d: pd.DataFrame) -> pd.DataF
     return out
 
 
+# ── AI Yorum Yardımcıları ────────────────────────────────────────────────────
+def _trend_dir(s: pd.Series) -> str:
+    s = s.dropna()
+    if len(s) < 5:
+        return "yetersiz"
+    x = np.arange(len(s))
+    try:
+        slope = np.polyfit(x, s.values, 1)[0]
+        rng = s.max() - s.min()
+        if rng == 0 or abs(slope) < rng * 0.001:
+            return "stabil"
+        return "yükseliyor" if slope > 0 else "azalıyor"
+    except Exception:
+        return "stabil"
+
+
+def _col_summary(metrics: pd.DataFrame, col: str) -> dict | None:
+    if col not in metrics.columns:
+        return None
+    s = metrics[col].dropna()
+    if s.empty:
+        return None
+    last_v = float(s.iloc[-1])
+    last_30 = metrics[col].tail(30).dropna()
+    last_90 = metrics[col].tail(90).dropna()
+    last_1y = metrics[col].tail(252).dropna() if len(metrics) >= 252 else s
+    pct = float((last_1y < last_v).mean() * 100) if len(last_1y) > 5 else None
+    return {
+        "son": round(last_v, 4),
+        "30g_medyan": round(float(last_30.median()), 4) if not last_30.empty else None,
+        "90g_medyan": round(float(last_90.median()), 4) if not last_90.empty else None,
+        "1y_medyan": round(float(last_1y.median()), 4) if not last_1y.empty else None,
+        "1y_persentil": round(pct, 1) if pct is not None else None,
+        "30g_trend": _trend_dir(last_30),
+    }
+
+
+def build_daily_payload(metrics: pd.DataFrame, ticker: str) -> dict:
+    if metrics.empty or len(metrics) < 30:
+        return {}
+    last = metrics.iloc[-1]
+    chg30 = None
+    if len(metrics) > 31:
+        chg30 = round(float((metrics["Kapanış (₺)"].iloc[-1] / metrics["Kapanış (₺)"].iloc[-31] - 1) * 100), 2)
+    return {
+        "ticker": ticker,
+        "veri_aralığı": f"{metrics.index[0].strftime('%Y-%m-%d')} → {metrics.index[-1].strftime('%Y-%m-%d')}",
+        "gözlem_sayısı": int(len(metrics)),
+        "fiyat": {
+            "son_kapanış": round(float(last["Kapanış (₺)"]), 2),
+            "son_değişim_%": round(float(last["Günlük Değ. (%)"]), 2) if pd.notna(last["Günlük Değ. (%)"]) else None,
+            "30g_getiri_%": chg30,
+        },
+        "likidite": {
+            "Daily_Range_%": _col_summary(metrics, "Daily Range (%)"),
+            "Amihud_x10_6":  _col_summary(metrics, "Amihud (×10⁶)"),
+            "log_Hacim":     _col_summary(metrics, "log₁₀(Hacim)"),
+            "C-S_Spread_%":  _col_summary(metrics, "C-S Spread (%)"),
+            "MEC":           _col_summary(metrics, "MEC"),
+        },
+        "volatilite": {
+            "Parkinson_%":    _col_summary(metrics, "Parkinson (%)"),
+            "Garman_Klass_%": _col_summary(metrics, "Garman-Klass (%)"),
+        },
+    }
+
+
+def build_intraday_payload(intra: pd.DataFrame, ticker: str, sel_date: str) -> dict:
+    if intra.empty:
+        return {}
+    return {
+        "ticker": ticker,
+        "tarih": sel_date,
+        "bar_sayısı": int(len(intra)),
+        "fiyat": {
+            "açılış": round(float(intra["Açılış"].iloc[0]), 4),
+            "kapanış": round(float(intra["Kapanış"].iloc[-1]), 4),
+            "yüksek": round(float(intra["Yüksek"].max()), 4),
+            "düşük": round(float(intra["Düşük"].min()), 4),
+            "değişim_%": round(float((intra["Kapanış"].iloc[-1] / intra["Açılış"].iloc[0] - 1) * 100), 2),
+        },
+        "likidite": {
+            "Bar_Range_%":   _col_summary(intra, "Bar Range (%)"),
+            "Amihud_2dk":    _col_summary(intra, "Amihud (2dk)"),
+            "C-S_Spread_%":  _col_summary(intra, "C-S Spread (%)"),
+            "RVOL":          _col_summary(intra, "RVOL"),
+        },
+        "volatilite": {
+            "Parkinson_%":    _col_summary(intra, "Parkinson (%)"),
+            "Garman_Klass_%": _col_summary(intra, "Garman-Klass (%)"),
+        },
+    }
+
+
+def extract_top_correlations(corr_matrix, cols, top_n: int = 5) -> list:
+    pairs = []
+    for i in range(len(cols)):
+        for j in range(i + 1, len(cols)):
+            pairs.append((cols[i], cols[j], float(corr_matrix[i][j])))
+    pairs.sort(key=lambda x: abs(x[2]), reverse=True)
+    return [{"çift": f"{a} ↔ {b}", "rho": round(r, 3)} for a, b, r in pairs[:top_n]]
+
+
+def build_daily_prompt(payload: dict, top_corr: list, level: str) -> str:
+    import json as _json
+    base = f"""Sen profesyonel bir BIST hisse senedi mikroyapı analiz uzmanısın. Aşağıdaki istatistikleri inceleyip Türkçe bir RAPOR YORUMU yaz.
+
+VERİ:
+{_json.dumps(payload, ensure_ascii=False, indent=2)}
+
+EN GÜÇLÜ KORELASYONLAR (Spearman):
+{_json.dumps(top_corr, ensure_ascii=False, indent=2)}
+"""
+    if level == "Az":
+        rules = """
+RAPOR FORMATI:
+## 🎯 Genel Durum
+Likidite × volatilite × fiyat üçgenini 2-3 cümleyle özetle. Rejimi adlandır (likit/illikit × volatil/sakin × dengeli/dengesiz).
+"""
+    elif level == "Orta":
+        rules = """
+RAPOR FORMATI:
+## 🎯 Genel Durum
+2-3 cümle özet, rejim adı.
+
+## 💧 Likidite Profili
+5 boyutu (Daily Range, Amihud, Hacim, C-S Spread, MEC) 1 yıllık persentile göre oku. Hangileri uç değerde, hangileri normal? Son 30g trendini söyle.
+
+## 📈 Volatilite Profili
+Parkinson vs Garman-Klass karşılaştır. GK > Parkinson belirgin farkla → drift'li günler (gap-up/gap-down baskın). Aralarında fark yokken ikisi de yüksekse → saf güniçi salınım. Trendi yorumla.
+"""
+    else:
+        rules = """
+RAPOR FORMATI:
+## 🎯 Genel Durum
+Likidite × volatilite × fiyat üçgenini 2-3 cümleyle özetle. Rejimi adlandır.
+
+## 💧 Likidite Profili
+5 boyutu (Daily Range, Amihud, Hacim, C-S Spread, MEC) 1 yıllık persentile göre oku. Her birinde son değer normal mi, uç mu? Son 30g trendini söyle. MEC'i yorumlarken 1.0 eşiğine dikkat et (≤1 dayanıklı, >1 yavaş döngü).
+
+## 📈 Volatilite Profili
+Parkinson vs Garman-Klass karşılaştır. GK > Parkinson belirgin farkla → drift'li günler (gap-up/gap-down baskın). Aralarında fark yokken ikisi de yüksekse → saf güniçi salınım. İkisinin de trendini ve persentilini yorumla.
+
+## 🔗 İlişki & Sinyal
+En güçlü 2-3 korelasyonu yorumla. Likidite ↔ volatilite ↔ fiyat üçgeninde ne tür bir bağlanma var? Hangi metrik hangisini yönlendiriyor?
+
+## ⚠️ Anomali & Dikkat
+Persentili %95'ten yüksek veya %5'ten düşük metrikler dikkat çekici. Son 30 gün trendinde keskin dönüş varsa belirt.
+"""
+    rules += """
+KURALLAR:
+- Türkçe yaz, sade ve teknik bir dil kullan.
+- Sayısal değerlere referans vererek konuş (persentil, son değer, trend yönü).
+- Veri dışı tahmin yapma; YATIRIM TAVSİYESİ VERME.
+- Markdown başlıklarını (##) aynen kullan.
+- Maddi/şirket-spesifik yorum yapma; sadece istatistiksel imza yorumla.
+"""
+    return base + rules
+
+
+def build_intraday_prompt(payload: dict, level: str) -> str:
+    import json as _json
+    base = f"""Sen profesyonel bir BIST hisse senedi GÜNİÇİ mikroyapı uzmanısın. 2 dakikalık bar verilerinden çıkarılmış aşağıdaki istatistikleri Türkçe yorumla.
+
+VERİ:
+{_json.dumps(payload, ensure_ascii=False, indent=2)}
+"""
+    if level == "Az":
+        rules = "## 🎯 Gün Özeti\nGünün likidite + volatilite imzasını 2-3 cümleyle özetle.\n"
+    elif level == "Orta":
+        rules = """## 🎯 Gün Özeti
+Günün likidite + volatilite imzasını özetle.
+
+## 💧 Güniçi Likidite
+Bar Range, Amihud, C-S Spread, RVOL profilini değerlendir. RVOL > 1.5 baskın mı, yoksa ince işlem mi?
+
+## 📈 Güniçi Volatilite
+Parkinson vs GK. Bar bazında salınım mı, yoksa drift mi?
+"""
+    else:
+        rules = """## 🎯 Gün Özeti
+Günün likidite + volatilite imzasını özetle, rejim adı ver.
+
+## 💧 Güniçi Likidite
+Bar Range, Amihud, C-S Spread, RVOL profilini değerlendir. RVOL ortalaması, persentili. Hangi metrik uç değerde?
+
+## 📈 Güniçi Volatilite
+Parkinson vs GK farkını yorumla. Aradaki fark drift sinyali (yön baskın), yokluğu salınım sinyali.
+
+## ⚠️ Anomali
+Trendlerde keskin değişim, uç persentil değerleri.
+"""
+    rules += """
+KURALLAR:
+- Türkçe, sade ve teknik dil.
+- Sayısal değerlere referans ver.
+- Yatırım tavsiyesi verme.
+- Markdown başlıkları (##) kullan.
+"""
+    return base + rules
+
+
+def gemini_generate(api_key: str, prompt: str, max_tokens: int = 4000, temperature: float = 0.4) -> dict:
+    import google.generativeai as genai
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel("gemini-2.5-flash")
+    resp = model.generate_content(
+        prompt,
+        generation_config={"max_output_tokens": max_tokens, "temperature": temperature},
+    )
+    usage = resp.usage_metadata
+    return {
+        "text": resp.text,
+        "input_tokens": int(getattr(usage, "prompt_token_count", 0) or 0),
+        "output_tokens": int(getattr(usage, "candidates_token_count", 0) or 0),
+        "total_tokens": int(getattr(usage, "total_token_count", 0) or 0),
+    }
+
+
+# Gemini-2.5-Flash fiyatlandırma (USD / 1M token, ~2025)
+GEMINI_FLASH_PRICE_IN = 0.30
+GEMINI_FLASH_PRICE_OUT = 2.50
+
+
 def compute_metrics(df: pd.DataFrame) -> pd.DataFrame:
     """Günlük kapanış, güniçi değişim, Amihud, Daily Range, Corwin-Schultz, MEC hesapla."""
     out = pd.DataFrame(index=df.index)
@@ -447,6 +671,37 @@ Open-Close hareketini hesaba kattığı için drift'li günlerde daha doğru.
     st.markdown("---")
     run = st.button("⚡ Veriyi Çek", use_container_width=True, type="primary")
     st.markdown("---")
+
+    # ── AI Rapor Yorumcusu ──────────────────────────────────────────────────
+    st.markdown("### 🤖 AI Rapor Yorumcusu")
+    gemini_key = st.text_input(
+        "Gemini API Key",
+        type="password",
+        key="gemini_api_key",
+        placeholder="api anahtarı buraya...",
+        help="API anahtarınız sadece bu oturumda kullanılır, hiçbir yere kaydedilmez.",
+    )
+    has_key = bool((gemini_key or "").strip())
+    key_badge = "✅ var" if has_key else "❌ yok"
+    st.markdown(
+        f"<span style='color:#94a3b8;font-size:0.85em'>Model: <b>gemini-2.5-flash</b> · Key: {key_badge}</span>",
+        unsafe_allow_html=True,
+    )
+    st.markdown("[🔑 API key al →](https://aistudio.google.com/app/api-keys)")
+    detail_level = st.select_slider(
+        "Detay Seviyesi",
+        options=["Az", "Orta", "Detaylı"],
+        value="Detaylı",
+    )
+    _max_tokens_map = {"Az": 1500, "Orta": 4000, "Detaylı": 8000}
+    ai_max_tokens   = _max_tokens_map[detail_level]
+    ai_temperature  = 0.4
+    st.markdown(
+        f"<span style='color:#6b7280;font-size:0.8em'>Max token: {ai_max_tokens} · Sıcaklık: {ai_temperature}</span>",
+        unsafe_allow_html=True,
+    )
+    st.markdown("---")
+
     auto_refresh = st.checkbox("🔄 Otomatik Yenile (55s)", value=False)
     if auto_refresh:
         import pytz
@@ -699,6 +954,38 @@ if run or "last_ticker" in st.session_state:
             <table class="data-table"><thead>{header_i}</thead><tbody>{rows_i}</tbody></table>
             </div>"""
             st.markdown(tbl_html, unsafe_allow_html=True)
+
+            # ── AI Rapor Yorumcusu (güniçi) ─────────────────────────────────
+            st.markdown("---")
+            st.markdown("### 🤖 AI Rapor Yorumu")
+
+            ai_c1, ai_c2 = st.columns([1, 4])
+            run_ai_intra = ai_c1.button("AI Yorum Üret", use_container_width=True, type="primary",
+                                        disabled=not has_key, key="run_ai_intra")
+            if not has_key:
+                ai_c2.info("Sidebar'dan Gemini API key girerek aktive edebilirsiniz.")
+
+            if run_ai_intra:
+                payload = build_intraday_payload(intra, _ticker, sel_date)
+                prompt  = build_intraday_prompt(payload, detail_level)
+                try:
+                    with st.spinner("Gemini yorum üretiyor..."):
+                        result = gemini_generate(gemini_key, prompt, ai_max_tokens, ai_temperature)
+                    st.session_state["ai_report_intra"] = {
+                        "ticker": _ticker, "date": sel_date, "level": detail_level, **result,
+                    }
+                except Exception as e:
+                    st.error(f"AI çağrısı başarısız: {e}")
+
+            rep_i = st.session_state.get("ai_report_intra")
+            if rep_i and rep_i.get("ticker") == _ticker and rep_i.get("date") == sel_date:
+                st.markdown(rep_i["text"])
+                in_t, out_t, tot_t = rep_i["input_tokens"], rep_i["output_tokens"], rep_i["total_tokens"]
+                cost = in_t * GEMINI_FLASH_PRICE_IN / 1_000_000 + out_t * GEMINI_FLASH_PRICE_OUT / 1_000_000
+                st.caption(
+                    f"📊 Token: **{in_t:,}** input + **{out_t:,}** output = **{tot_t:,}** toplam · "
+                    f"Tahmini maliyet: **${cost:.5f}** · Detay: *{rep_i['level']}*"
+                )
 
     # ── Günlük Mod ───────────────────────────────────────────────────────────
     else:
@@ -1091,6 +1378,39 @@ if run or "last_ticker" in st.session_state:
             xaxis=dict(showgrid=False),
         )
         st.plotly_chart(roll_fig, use_container_width=True, config={"scrollZoom": True, "dragmode": "pan"})
+
+        # ── AI Rapor Yorumcusu (günlük) ─────────────────────────────────────
+        st.markdown("---")
+        st.markdown("### 🤖 AI Rapor Yorumu")
+
+        c1, c2 = st.columns([1, 4])
+        run_ai = c1.button("AI Yorum Üret", use_container_width=True, type="primary",
+                           disabled=not has_key, key="run_ai_daily")
+        if not has_key:
+            c2.info("Sidebar'dan Gemini API key girerek aktive edebilirsiniz.")
+
+        if run_ai:
+            payload   = build_daily_payload(metrics, _ticker)
+            top_corr  = extract_top_correlations(corr_matrix, cols3, top_n=6)
+            prompt    = build_daily_prompt(payload, top_corr, detail_level)
+            try:
+                with st.spinner("Gemini yorum üretiyor..."):
+                    result = gemini_generate(gemini_key, prompt, ai_max_tokens, ai_temperature)
+                st.session_state["ai_report_daily"] = {
+                    "ticker": _ticker, "level": detail_level, **result,
+                }
+            except Exception as e:
+                st.error(f"AI çağrısı başarısız: {e}")
+
+        rep = st.session_state.get("ai_report_daily")
+        if rep and rep.get("ticker") == _ticker:
+            st.markdown(rep["text"])
+            in_t, out_t, tot_t = rep["input_tokens"], rep["output_tokens"], rep["total_tokens"]
+            cost = in_t * GEMINI_FLASH_PRICE_IN / 1_000_000 + out_t * GEMINI_FLASH_PRICE_OUT / 1_000_000
+            st.caption(
+                f"📊 Token: **{in_t:,}** input + **{out_t:,}** output = **{tot_t:,}** toplam · "
+                f"Tahmini maliyet: **${cost:.5f}** · Detay: *{rep['level']}*"
+            )
 
         st.markdown("---")
         import io
