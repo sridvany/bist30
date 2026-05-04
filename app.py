@@ -1034,25 +1034,6 @@ if run or "last_ticker" in st.session_state:
         )
         st.plotly_chart(roll_fig, use_container_width=True, config={"scrollZoom": True, "dragmode": "pan"})
 
-        st.markdown("**Volatilite Rejimi (Daily Range medyanı bazlı)**")
-        median_dr = ana["Daily Range"].median()
-        ana["Rejim"] = ana["Daily Range"].apply(lambda x: "Yüksek Vol." if x >= median_dr else "Düşük Vol.")
-
-        reg_fig = go.Figure()
-        for rejim, color, dash in [("Yüksek Vol.", "#ef4444", "solid"), ("Düşük Vol.", "#22c55e", "solid")]:
-            mask = ana["Rejim"] == rejim
-            reg_fig.add_trace(go.Scatter(x=ana.index[mask], y=ana["Close"][mask],
-                mode="markers", name=rejim, marker=dict(color=color, size=3, opacity=0.6)))
-        reg_fig.update_layout(
-            paper_bgcolor="#0f1117", plot_bgcolor="#0f1117",
-            font=dict(family="IBM Plex Mono", color="#94a3b8", size=11),
-            legend=dict(orientation="h", y=1.1, bgcolor="rgba(0,0,0,0)"),
-            margin=dict(l=10, r=10, t=30, b=10), height=300,
-            yaxis=dict(title="Kapanış", showgrid=True, gridcolor="#1e2235"),
-            xaxis=dict(showgrid=False),
-        )
-        st.plotly_chart(reg_fig, use_container_width=True, config={"scrollZoom": True, "dragmode": "pan"})
-
         st.markdown("---")
         import io
         excel_df = metrics.iloc[::-1].copy()
