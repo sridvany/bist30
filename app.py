@@ -264,6 +264,7 @@ def build_daily_payload(metrics: pd.DataFrame, ticker: str) -> dict:
             "Parkinson_%":    _col_summary(metrics, "Parkinson (%)"),
             "Garman_Klass_%": _col_summary(metrics, "Garman-Klass (%)"),
         },
+        "yön_asimetrisi_60g": _direction_asymmetry(metrics, lookback=60),
     }
 
 
@@ -290,6 +291,42 @@ def build_intraday_payload(intra: pd.DataFrame, ticker: str, sel_date: str) -> d
         "volatilite": {
             "Parkinson_%":    _col_summary(intra, "Parkinson (%)"),
             "Garman_Klass_%": _col_summary(intra, "Garman-Klass (%)"),
+        },
+    }
+
+
+def _direction_asymmetry(metrics: pd.DataFrame, lookback: int = 60) -> dict:
+    n = min(lookback, len(metrics))
+    df = metrics.tail(n)
+    chg = df["Günlük Değ. (%)"]
+    up   = df[chg > 0]
+    down = df[chg < 0]
+
+    def m(col, group):
+        if col not in group.columns:
+            return None
+        s = group[col].dropna()
+        return round(float(s.mean()), 4) if not s.empty else None
+
+    return {
+        "lookback_g": int(n),
+        "up_gün_sayısı":   int(len(up)),
+        "down_gün_sayısı": int(len(down)),
+        "up_ortalama": {
+            "log_Hacim":       m("log₁₀(Hacim)", up),
+            "Daily_Range_%":   m("Daily Range (%)", up),
+            "Parkinson_%":     m("Parkinson (%)", up),
+            "Garman_Klass_%":  m("Garman-Klass (%)", up),
+            "Amihud_x10_6":    m("Amihud (×10⁶)", up),
+            "C-S_Spread_%":    m("C-S Spread (%)", up),
+        },
+        "down_ortalama": {
+            "log_Hacim":       m("log₁₀(Hacim)", down),
+            "Daily_Range_%":   m("Daily Range (%)", down),
+            "Parkinson_%":     m("Parkinson (%)", down),
+            "Garman_Klass_%":  m("Garman-Klass (%)", down),
+            "Amihud_x10_6":    m("Amihud (×10⁶)", down),
+            "C-S_Spread_%":    m("C-S Spread (%)", down),
         },
     }
 
@@ -330,6 +367,9 @@ RAPOR FORMATI:
 
 ## 📈 Volatilite Profili
 Parkinson vs Garman-Klass karşılaştır. GK > Parkinson belirgin farkla → drift'li günler (gap-up/gap-down baskın). Aralarında fark yokken ikisi de yüksekse → saf güniçi salınım. Trendi yorumla.
+
+## 🔗 Yön Asimetrisi
+yön_asimetrisi_60g verisinden up-day vs down-day ortalamalarını karşılaştır. Hacim ve volatilite hangi yönde baskın? Korku rejimi mi, sağlıklı ralli mi, dağıtım mı?
 """
     else:
         rules = """
@@ -345,6 +385,14 @@ Parkinson vs Garman-Klass karşılaştır. GK > Parkinson belirgin farkla → dr
 
 ## 🔗 İlişki & Sinyal
 En güçlü 2-3 korelasyonu yorumla. Likidite ↔ volatilite ↔ fiyat üçgeninde ne tür bir bağlanma var? Hangi metrik hangisini yönlendiriyor?
+
+Ayrıca **yön asimetrisini** (yön_asimetrisi_60g; up-day vs down-day ortalamaları) yorumla. Aşağıdaki klasik mikroyapı kalıplarını kullan:
+- Down-day vol > Up-day vol **ve** Down-day Amihud > Up-day Amihud → **KORKU REJİMİ** (satışlarda likidite kuruyor)
+- Up-day log_Hacim > Down-day log_Hacim **ve** Up-day vol düşük → **SAĞLIKLI RALLİ** (kurumsal alım/birikim)
+- Up-day log_Hacim < Down-day log_Hacim → **DAĞITIM SİNYALİ** (alımda hacim zayıf, satışta yüksek)
+- Up-day C-S Spread < Down-day C-S Spread → likidite yükselişi destekliyor
+- Up-day vol > Down-day vol **ve** Up-day Amihud düşük → **TAVAN/EUFORİ** (çıkışlarda agresif alım, fiyat tavizi yok)
+Veriden hangi kalıba en yakın olduğunu söyle, sayısal farklara referans vererek.
 
 ## ⚠️ Anomali & Dikkat
 Persentili %95'ten yüksek veya %5'ten düşük metrikler dikkat çekici. Son 30 gün trendinde keskin dönüş varsa belirt.
