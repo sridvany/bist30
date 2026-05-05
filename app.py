@@ -971,6 +971,7 @@ if run or "last_ticker" in st.session_state:
                 legend=dict(orientation="h", y=1.05, bgcolor="rgba(0,0,0,0)"),
                 margin=dict(l=10, r=10, t=40, b=10), height=380,
                 title=dict(text="Güniçi Fiyat & Hacim", font=dict(color="#94a3b8", size=12)),
+                dragmode="pan",
             )
             fig_i.update_xaxes(showgrid=False, color="#94a3b8")
             fig_i.update_yaxes(title_text="Kapanış", title_font=dict(color="#22c55e"),
