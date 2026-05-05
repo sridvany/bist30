@@ -861,7 +861,7 @@ if run or "last_ticker" in st.session_state:
             if atr_today is None:
                 k5.metric("Volatilite (ATR)", "—")
             else:
-                k5.metric("Volatilite (ATR)", f"{atr_today:.2f} ₺",
+                k5.metric("Volatilite (ATR)", f"{atr_today:.2f}",
                           atr_label, delta_color="off")
             st.markdown("---")
 
