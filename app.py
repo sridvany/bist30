@@ -946,6 +946,24 @@ if run or "last_ticker" in st.session_state:
             fig_i.add_trace(go.Bar(x=intra.index, y=intra["Hacim"],
                 name="Hacim", marker_color="#7dd3fc", opacity=0.3), secondary_y=True)
 
+            # ── Likidite & Volatilite boyutları (varsayılan kapalı, legend'dan aç/kapa) ──
+            # Tümü sağ eksene ekleniyor; aynı anda birden fazla açıldığında ölçekler çakışabilir.
+            atr_pct = (intra["ATR (₺)"] / intra["Kapanış"] * 100)
+            log_amihud_i = np.log10(intra["Amihud (2dk)"].replace(0, np.nan)).abs()
+
+            extra_traces = [
+                ("Bar Range (%)",  intra["Bar Range (%)"], "#06b6d4"),
+                ("RVOL",           intra["RVOL"],          "#ec4899"),
+                ("C-S Spread (%)", intra["C-S Spread (%)"],"#a78bfa"),
+                ("log₁₀|Amihud|",  log_amihud_i,           "#f59e0b"),
+                ("ATR (%)",        atr_pct,                "#fb923c"),
+            ]
+            for name, series, color in extra_traces:
+                s = series.dropna()
+                fig_i.add_trace(go.Scatter(x=s.index, y=s.values,
+                    name=name, line=dict(color=color, width=1.2),
+                    visible="legendonly"), secondary_y=True)
+
             fig_i.update_layout(
                 paper_bgcolor="#0f1117", plot_bgcolor="#0f1117",
                 font=dict(family="IBM Plex Mono", color="#94a3b8", size=11),
