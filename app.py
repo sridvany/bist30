@@ -147,21 +147,35 @@ def fetch_intraday_60d(ticker: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 @st.cache_data(ttl=120, show_spinner=False, persist=False)
-def fetch_prev_close(ticker: str, selected_date: str) -> float | None:
-    """Seçili günden önceki iş gününün kapanışı (yfinance 1d seri — previousClose ile aynı)."""
+def fetch_daily_ohlc(ticker: str, selected_date: str) -> dict:
+    """Seçili gün ve önceki günün 1d OHLCV verisi.
+    1d seri BIST kapanış seansı (closing auction) dahil resmi değerleri içerir;
+    Yahoo Finance'in gösterdiği 'previousClose' ile bire bir uyumludur.
+    """
     try:
         df = yf.download(ticker, period="10d", interval="1d",
                          auto_adjust=True, progress=False)
         if df.empty:
-            return None
+            return {}
         df = _flatten(df)
         sel = pd.Timestamp(selected_date).date()
-        prev = df[df.index.date < sel]
-        if prev.empty:
-            return None
-        return float(prev["Close"].iloc[-1])
+        sel_df  = df[df.index.date == sel]
+        prev_df = df[df.index.date < sel]
+        out = {}
+        if not sel_df.empty:
+            r = sel_df.iloc[-1]
+            out.update({
+                "open":   float(r["Open"]),
+                "high":   float(r["High"]),
+                "low":    float(r["Low"]),
+                "close":  float(r["Close"]),
+                "volume": float(r["Volume"]),
+            })
+        if not prev_df.empty:
+            out["prev_close"] = float(prev_df["Close"].iloc[-1])
+        return out
     except Exception:
-        return None
+        return {}
 
 def compute_intraday_metrics(df: pd.DataFrame, df_60d: pd.DataFrame) -> pd.DataFrame:
     """2dk bar metrikleri: fiyat, hacim, RVOL, Daily Range, Amihud, C-S Spread."""
@@ -814,11 +828,14 @@ if run or "last_ticker" in st.session_state:
             st.markdown(f"### ⏱️ {_ticker} — {pd.Timestamp(sel_date).strftime('%d.%m.%Y')} Güniçi Analiz")
             intra = compute_intraday_metrics(df_day, df_60d)
 
-            open_p  = df_day["Open"].iloc[0]
-            close_p = df_day["Close"].iloc[-1]
-            high_p  = df_day["High"].max()
-            low_p   = df_day["Low"].min()
-            prev_close = fetch_prev_close(_ticker, sel_date)
+            # Resmi kapanış (auction dahil) için 1d seri; bar-level metrikler 2dk seriden
+            daily = fetch_daily_ohlc(_ticker, sel_date)
+            open_p  = daily.get("open",   float(df_day["Open"].iloc[0]))
+            close_p = daily.get("close",  float(df_day["Close"].iloc[-1]))
+            high_p  = daily.get("high",   float(df_day["High"].max()))
+            low_p   = daily.get("low",    float(df_day["Low"].min()))
+            prev_close = daily.get("prev_close")
+
             if prev_close is not None and prev_close > 0:
                 gunici_chg = (close_p - prev_close) / prev_close * 100
             else:
