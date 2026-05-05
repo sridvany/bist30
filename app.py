@@ -836,7 +836,33 @@ if run or "last_ticker" in st.session_state:
             k2.metric("Kapanış", f"{close_p:.2f}", f"{chg_sign}{gunici_chg:.2f}%")
             k3.metric("Yüksek",  f"{high_p:.2f}")
             k4.metric("Düşük",   f"{low_p:.2f}")
-            k5.metric("Günlük Range", f"{((high_p - low_p) / low_p * 100):.2f}%")
+
+            # Volatilite: bugünün son bar ATR'i + 60g historical persentil etiketi
+            atr_series = intra["ATR (₺)"].dropna()
+            atr_today  = float(atr_series.iloc[-1]) if not atr_series.empty else None
+            atr_label  = None
+            if atr_today is not None and not df_60d.empty:
+                def _last_atr(g):
+                    pc = g["Close"].shift(1)
+                    tr = pd.concat([g["High"] - g["Low"],
+                                    (g["High"] - pc).abs(),
+                                    (g["Low"]  - pc).abs()], axis=1).max(axis=1)
+                    a = tr.ewm(alpha=1/30, adjust=False, min_periods=30).mean().dropna()
+                    return a.iloc[-1] if not a.empty else np.nan
+                sel_dt = pd.Timestamp(sel_date).date()
+                prev_days = df_60d[df_60d.index.date != sel_dt]
+                hist_atr  = (prev_days.groupby(prev_days.index.date)
+                                       .apply(_last_atr).dropna())
+                if len(hist_atr) >= 10:
+                    p25, p75 = hist_atr.quantile(0.25), hist_atr.quantile(0.75)
+                    if   atr_today > p75: atr_label = "Yüksek"
+                    elif atr_today < p25: atr_label = "Düşük"
+                    else:                 atr_label = "Normal"
+            if atr_today is None:
+                k5.metric("Volatilite (ATR)", "—")
+            else:
+                k5.metric("Volatilite (ATR)", f"{atr_today:.2f} ₺",
+                          atr_label, delta_color="off")
             st.markdown("---")
 
             def intraday_yorum(intra: pd.DataFrame, ticker: str, sel_date: str) -> None:
