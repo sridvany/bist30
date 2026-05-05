@@ -944,10 +944,11 @@ if run or "last_ticker" in st.session_state:
                 customdata=intra["Değişim (%)"][down_m],
                 hovertemplate="%{x}<br>%{y}<br>%{customdata:.3f}%<extra></extra>"), secondary_y=False)
             fig_i.add_trace(go.Bar(x=intra.index, y=intra["Hacim"],
-                name="Hacim", marker_color="#7dd3fc", opacity=0.3), secondary_y=True)
+                name="Hacim", marker_color="#7dd3fc", opacity=0.3,
+                visible="legendonly"), secondary_y=True)
 
             # ── Likidite & Volatilite boyutları (varsayılan kapalı, legend'dan aç/kapa) ──
-            # Tümü sağ eksene ekleniyor; aynı anda birden fazla açıldığında ölçekler çakışabilir.
+            # Sağ eksen, açılan göstergeye göre otomatik yeniden ölçeklenir.
             atr_pct = (intra["ATR (₺)"] / intra["Kapanış"] * 100)
             log_amihud_i = np.log10(intra["Amihud (2dk)"].replace(0, np.nan)).abs()
 
@@ -975,8 +976,9 @@ if run or "last_ticker" in st.session_state:
             fig_i.update_yaxes(title_text="Kapanış", title_font=dict(color="#22c55e"),
                                tickfont=dict(color="#22c55e"), showgrid=True,
                                gridcolor="#1e2235", secondary_y=False)
-            fig_i.update_yaxes(title_text="Hacim", title_font=dict(color="#7dd3fc"),
-                               tickfont=dict(color="#7dd3fc"), showgrid=False, secondary_y=True)
+            fig_i.update_yaxes(title_text="Gösterge", title_font=dict(color="#7dd3fc"),
+                               tickfont=dict(color="#7dd3fc"), showgrid=False,
+                               autorange=True, secondary_y=True)
             st.plotly_chart(fig_i, use_container_width=True, config={"scrollZoom": True, "displayModeBar": True})
 
             fig_l = make_subplots(rows=3, cols=1, shared_xaxes=True,
