@@ -618,7 +618,7 @@ with st.sidebar:
 
     ticker_input = st.text_input(
         "🔍 Ticker",
-        value="GARAN.IS",
+        value="gc=f",
         placeholder="Örn: GARAN.IS, AAPL, BTC-USD",
         help="Herhangi bir yFinance ticker girin"
     ).strip().upper()
