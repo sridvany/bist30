@@ -7,6 +7,7 @@ from scipy.stats import spearmanr          # FIX 2: dosya başına taşındı
 import warnings
 from plotly.subplots import make_subplots
 import plotly.graph_objects as go
+import plotly.express as px
 warnings.filterwarnings("ignore")
 
 # ── Sayfa Ayarları ──────────────────────────────────────────────────────────
@@ -681,31 +682,56 @@ def build_lab_frame(metrics: pd.DataFrame, *, scale: str,
     return df
 
 
-def render_lab_panel(metrics: pd.DataFrame, *, scale: str,
-                     horizons: list[int], lookback: int) -> None:
-    """Aşama 1 önizleme paneli: frame özeti + son bar feature kartı + tail."""
-    if metrics is None or metrics.empty:
-        st.info("🔬 Lab: veri yok.")
-        return
+def build_l1_heatmap(lab: pd.DataFrame, *, primary: str, secondary: str,
+                     target: str, min_obs: int = 10) -> pd.DataFrame | None:
+    """L1 — Koşullu forward return tablosu (3×3 dilim).
 
-    lab = build_lab_frame(metrics, scale=scale, horizons=horizons, lookback=lookback)
+    Persentile (_pct sütunundan) low/mid/high diliminde gruplar; her hücrede
+    forward return ortalaması, hit-rate (>0 oranı), Sharpe (mean/std) ve
+    gözlem sayısı (n). n < min_obs ise istatistikler NaN'lanır.
+    """
+    p_pct = lab.get(f"{primary}_pct")
+    s_pct = lab.get(f"{secondary}_pct")
+    if p_pct is None or s_pct is None or target not in lab.columns:
+        return None
+
+    df = pd.DataFrame({
+        "p_pct": p_pct,
+        "s_pct": s_pct,
+        "y":     lab[target],
+    }).dropna()
+    if df.empty:
+        return None
+
+    edges  = [-0.01, 1/3, 2/3, 1.01]
+    labels = ["low", "mid", "high"]
+    df["primary_bin"]   = pd.cut(df["p_pct"], bins=edges, labels=labels)
+    df["secondary_bin"] = pd.cut(df["s_pct"], bins=edges, labels=labels)
+
+    out = df.groupby(["primary_bin", "secondary_bin"], observed=False).agg(
+        mean=("y", "mean"),
+        std =("y", "std"),
+        n   =("y", "size"),
+        pos =("y", lambda s: int((s > 0).sum())),
+    ).reset_index()
+    out["hit_rate"] = out["pos"] / out["n"].replace(0, np.nan)
+    out["sharpe"]   = out["mean"] / out["std"].replace(0, np.nan)
+    out.loc[out["n"] < min_obs, ["mean", "std", "hit_rate", "sharpe"]] = np.nan
+    return out
+
+
+def _render_lab_setup(lab: pd.DataFrame, *, scale: str) -> None:
+    """Aşama 1 — Altyapı sekmesi (son bar kartı, fwd_ret özet, tail)."""
     feat_cols = LAB_FEATURES_DAILY if scale == "daily" else LAB_FEATURES_INTRADAY
     feat_cols = [c for c in feat_cols if c in lab.columns]
     fwd_cols  = [c for c in lab.columns if c.startswith("fwd_ret_")]
 
-    st.markdown("## 🔬 Lab — Aşama 1: Altyapı")
-    st.caption(
-        f"Ölçek: **{scale}** · Lookback: **{lookback}** · "
-        f"Ufuklar: **{horizons}** · Frame: **{lab.shape[0]} × {lab.shape[1]}**"
-    )
-
-    # Son bar feature kartı: değer | z | persentil ----------------------------
     last = lab.iloc[-1]
 
     def _fmt_val(c, v):
         if pd.isna(v):
             return "—"
-        if c in LAB_LOG_FEATURES:                       # Amihud → |log₁₀|
+        if c in LAB_LOG_FEATURES:
             return f"{abs(np.log10(v)):.2f}" if v > 0 else "—"
         return f"{v:.4f}"
 
@@ -721,11 +747,9 @@ def render_lab_panel(metrics: pd.DataFrame, *, scale: str,
             "z":      _fmt_z(last.get(f"{c}_z", np.nan)),
             "pct":    _fmt_pct(last.get(f"{c}_pct", np.nan)),
         })
-    card = pd.DataFrame(rows)
     st.markdown("**Son bar — feature kartı**")
-    st.dataframe(card, use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-    # Forward return durumu (kaç satır NaN değil) -----------------------------
     if fwd_cols:
         valid = {c: int(lab[c].notna().sum()) for c in fwd_cols}
         st.markdown("**Forward return — geçerli satır sayısı**")
@@ -739,9 +763,116 @@ def render_lab_panel(metrics: pd.DataFrame, *, scale: str,
             f"'{LAB_CLOSE_COL.get(scale, '?')}' — frame'de bulunamadı."
         )
 
-    # Tail preview ------------------------------------------------------------
     with st.expander("📋 Frame tail (son 20)"):
         st.dataframe(lab.tail(20), use_container_width=True)
+
+
+def _render_l1_heatmap(lab: pd.DataFrame, *, scale: str) -> None:
+    """Aşama 2 — L1 koşullu forward return ısı haritası."""
+    feat_cols = LAB_FEATURES_DAILY if scale == "daily" else LAB_FEATURES_INTRADAY
+    # Hedef getirinin kendisi olan değişim sütununu primary/secondary'den çıkar
+    ret_col = "Günlük Değ. (%)" if scale == "daily" else "Değişim (%)"
+    feat_cols = [c for c in feat_cols if c in lab.columns and c != ret_col]
+
+    fwd_cols = [c for c in lab.columns if c.startswith("fwd_ret_")]
+    if not fwd_cols:
+        st.warning("⚠️ L1 için forward return gerekli. Sidebar'da en az bir ufuk seç.")
+        return
+    if len(feat_cols) < 2:
+        st.warning("⚠️ L1 için en az 2 feature gerekli.")
+        return
+
+    # Kontroller --------------------------------------------------------------
+    default_secondary = "ATR" if "ATR" in feat_cols else feat_cols[-1]
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        primary = st.selectbox("Likidite ekseni (y)", feat_cols, index=0,
+                               key=f"l1_p_{scale}")
+    with c2:
+        secondary = st.selectbox("Volatilite ekseni (x)", feat_cols,
+                                 index=feat_cols.index(default_secondary),
+                                 key=f"l1_s_{scale}")
+    with c3:
+        target = st.selectbox("Hedef ufuk", fwd_cols, index=0,
+                              key=f"l1_t_{scale}")
+    with c4:
+        metric = st.selectbox("Hücre değeri",
+                              ["Ortalama (%)", "Hit-rate", "Sharpe", "n"],
+                              key=f"l1_m_{scale}")
+    min_obs = st.slider("Min gözlem (n)", 5, 50, 10, 5, key=f"l1_min_{scale}")
+
+    if primary == secondary:
+        st.info("Aynı metrik iki eksende seçildi — anlamlı hücre yok. Farklı bir metrik seç.")
+        return
+
+    # Hesap -------------------------------------------------------------------
+    hm = build_l1_heatmap(lab, primary=primary, secondary=secondary,
+                          target=target, min_obs=min_obs)
+    if hm is None or hm["mean"].notna().sum() == 0:
+        st.info("Yeterli gözlem yok — lookback veya min_obs'i ayarlamayı dene.")
+        return
+
+    metric_key = {"Ortalama (%)": "mean", "Hit-rate": "hit_rate",
+                  "Sharpe": "sharpe", "n": "n"}[metric]
+    pivot = hm.pivot(index="primary_bin", columns="secondary_bin", values=metric_key)
+    pivot = pivot.reindex(index=["low", "mid", "high"], columns=["low", "mid", "high"])
+
+    # Sıfır-merkezli skala mean ve sharpe için anlamlı; hit_rate için 0.5, n için yok
+    fmt = ".0f" if metric_key == "n" else (".2%" if metric_key == "hit_rate" else ".3f")
+    midpoint = 0 if metric_key in ("mean", "sharpe") else (
+        0.5 if metric_key == "hit_rate" else None
+    )
+    fig = px.imshow(
+        pivot,
+        labels=dict(x=f"{secondary} (pct)", y=f"{primary} (pct)", color=metric),
+        x=pivot.columns, y=pivot.index,
+        color_continuous_scale="RdYlGn",
+        color_continuous_midpoint=midpoint,
+        aspect="auto",
+        text_auto=fmt,
+    )
+    fig.update_layout(height=380, margin=dict(l=10, r=10, t=30, b=10))
+    st.plotly_chart(fig, use_container_width=True)
+
+    # n tablosu (boyut kontrolü) ---------------------------------------------
+    with st.expander("📊 Hücre detayları (n, mean, hit_rate, sharpe)"):
+        detail = hm.pivot_table(index="primary_bin", columns="secondary_bin",
+                                values=["mean", "hit_rate", "sharpe", "n"])
+        st.dataframe(detail.round(4), use_container_width=True)
+
+    # Top hücreler ------------------------------------------------------------
+    st.markdown("**🏆 En güçlü hücreler (|ortalama| en yüksek)**")
+    top = hm.dropna(subset=["mean"]).copy()
+    top["|mean|"] = top["mean"].abs()
+    top = top.sort_values("|mean|", ascending=False).head(5)
+    if top.empty:
+        st.caption("Geçerli hücre yok.")
+    else:
+        show = top[["primary_bin", "secondary_bin", "mean", "hit_rate", "sharpe", "n"]].copy()
+        show.columns = [f"{primary} bin", f"{secondary} bin", "mean (%)", "hit-rate", "sharpe", "n"]
+        st.dataframe(show.round(4), use_container_width=True, hide_index=True)
+
+
+def render_lab_panel(metrics: pd.DataFrame, *, scale: str,
+                     horizons: list[int], lookback: int) -> None:
+    """Lab paneli — Altyapı + L1 Heatmap (tabs)."""
+    if metrics is None or metrics.empty:
+        st.info("🔬 Lab: veri yok.")
+        return
+
+    lab = build_lab_frame(metrics, scale=scale, horizons=horizons, lookback=lookback)
+
+    st.markdown("## 🔬 Lab")
+    st.caption(
+        f"Ölçek: **{scale}** · Lookback: **{lookback}** · "
+        f"Ufuklar: **{horizons}** · Frame: **{lab.shape[0]} × {lab.shape[1]}**"
+    )
+
+    tab_setup, tab_l1 = st.tabs(["📦 Aşama 1 — Altyapı", "🔥 L1 — Koşullu Heatmap"])
+    with tab_setup:
+        _render_lab_setup(lab, scale=scale)
+    with tab_l1:
+        _render_l1_heatmap(lab, scale=scale)
 
 
 def color_val(val, col):
