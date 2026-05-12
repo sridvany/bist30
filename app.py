@@ -618,6 +618,11 @@ LAB_FEATURES_INTRADAY = [
     "Bar Range (%)", "RVOL", "Amihud (2dk)",
     "C-S Spread (%)", "MEC", "ATR", "Değişim (%)",
 ]
+# z-skor ve persentil log₁₀ uzayında hesaplanan sütunlar (sağa-çarpık dağılımlar)
+LAB_LOG_FEATURES = {"Amihud (×10⁶)", "Amihud (2dk)"}
+# Forward return için kapanış sütunu (scale'e göre)
+LAB_CLOSE_COL = {"daily": "Kapanış (₺)", "intraday": "Kapanış"}
+
 
 def build_lab_frame(metrics: pd.DataFrame, *, scale: str,
                     horizons: list[int], lookback: int) -> pd.DataFrame:
@@ -635,6 +640,7 @@ def build_lab_frame(metrics: pd.DataFrame, *, scale: str,
     DataFrame
         Orijinal sütunlar + her feature için "{col}_z" ve "{col}_pct" +
         her ufuk için "fwd_ret_{N}" (%). Intraday'de ek olarak "fwd_ret_eod".
+        Amihud sütunları log₁₀ uzayında istatistiklenir.
     """
     if metrics is None or metrics.empty:
         return metrics
@@ -646,22 +652,25 @@ def build_lab_frame(metrics: pd.DataFrame, *, scale: str,
     # 1) Rolling z-skor ve persentile -----------------------------------------
     min_p = max(10, lookback // 4)
     for c in feat_cols:
-        s = pd.to_numeric(df[c], errors="coerce")
+        s_raw = pd.to_numeric(df[c], errors="coerce")
+        # Sağa-çarpık metrikler log uzayında daha iyi davranır
+        s = np.log10(s_raw.where(s_raw > 0)) if c in LAB_LOG_FEATURES else s_raw
+
         roll = s.rolling(lookback, min_periods=min_p)
         mu, sd = roll.mean(), roll.std(ddof=1)
         df[f"{c}_z"]   = ((s - mu) / sd.replace(0, np.nan)).round(4)
         try:
             df[f"{c}_pct"] = roll.rank(pct=True).round(4)
         except Exception:
-            # Eski pandas için fallback
             df[f"{c}_pct"] = s.rolling(lookback, min_periods=min_p).apply(
                 lambda x: (x.iloc[-1] > x.iloc[:-1]).mean() if len(x) > 1 else np.nan,
                 raw=False,
             ).round(4)
 
     # 2) Forward return (%) ---------------------------------------------------
-    if "Kapanış" in df.columns:
-        close = pd.to_numeric(df["Kapanış"], errors="coerce")
+    close_col = LAB_CLOSE_COL.get(scale)
+    if close_col and close_col in df.columns:
+        close = pd.to_numeric(df[close_col], errors="coerce")
         for h in horizons:
             df[f"fwd_ret_{h}"] = ((close.shift(-h) / close - 1.0) * 100).round(4)
         if scale == "intraday" and len(close) > 1:
@@ -692,28 +701,42 @@ def render_lab_panel(metrics: pd.DataFrame, *, scale: str,
 
     # Son bar feature kartı: değer | z | persentil ----------------------------
     last = lab.iloc[-1]
+
+    def _fmt_val(c, v):
+        if pd.isna(v):
+            return "—"
+        if c in LAB_LOG_FEATURES:                       # Amihud → |log₁₀|
+            return f"{abs(np.log10(v)):.2f}" if v > 0 else "—"
+        return f"{v:.4f}"
+
+    def _fmt_z(v):   return "—" if pd.isna(v) else f"{v:+.2f}"
+    def _fmt_pct(v): return "—" if pd.isna(v) else f"{v:.2%}"
+
     rows = []
     for c in feat_cols:
+        label = c + (" (|log₁₀|)" if c in LAB_LOG_FEATURES else "")
         rows.append({
-            "Metrik": c,
-            "Değer":  last[c]            if c in lab.columns else np.nan,
-            "z":      last.get(f"{c}_z",   np.nan),
-            "pct":    last.get(f"{c}_pct", np.nan),
+            "Metrik": label,
+            "Değer":  _fmt_val(c, last[c] if c in lab.columns else np.nan),
+            "z":      _fmt_z(last.get(f"{c}_z", np.nan)),
+            "pct":    _fmt_pct(last.get(f"{c}_pct", np.nan)),
         })
     card = pd.DataFrame(rows)
     st.markdown("**Son bar — feature kartı**")
-    st.dataframe(
-        card.style.format({"Değer": "{:.4f}", "z": "{:+.2f}", "pct": "{:.2%}"}),
-        use_container_width=True, hide_index=True,
-    )
+    st.dataframe(card, use_container_width=True, hide_index=True)
 
     # Forward return durumu (kaç satır NaN değil) -----------------------------
     if fwd_cols:
         valid = {c: int(lab[c].notna().sum()) for c in fwd_cols}
         st.markdown("**Forward return — geçerli satır sayısı**")
         st.dataframe(
-            pd.DataFrame([valid]).T.rename(columns={0: "valid_n"}),
+            pd.DataFrame.from_dict(valid, orient="index", columns=["valid_n"]),
             use_container_width=True,
+        )
+    else:
+        st.warning(
+            f"⚠️ Forward return üretilemedi. Beklenen close sütunu: "
+            f"'{LAB_CLOSE_COL.get(scale, '?')}' — frame'de bulunamadı."
         )
 
     # Tail preview ------------------------------------------------------------
