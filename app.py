@@ -721,6 +721,175 @@ def build_l1_heatmap(lab: pd.DataFrame, *, primary: str, secondary: str,
 
 
 # ── Aşama 3 — Sinyal Kartı yardımcıları ──────────────────────────────────────
+def run_backtest(lab: pd.DataFrame, *, primary: str, secondary: str,
+                 target: str, close_col: str,
+                 init_train: int = 252, recalib_period: int = 60,
+                 min_sharpe: float = 0.15, min_n: int = 50,
+                 commission: float = 0.001) -> dict | None:
+    """Walk-forward backtest — long-only, sabit ufuk.
+
+    Mantık
+    ------
+    - İlk `init_train` bar kalibrasyon penceresi (sinyal üretilmez)
+    - Sonraki her bar t için:
+      * Pozisyon açık ve ufuk doldu mu? → kapat (PnL kaydet)
+      * Yeniden kalibrasyon zamanı mı? → 0..t-horizon verisinden heatmap yenile
+      * Pozisyon yoksa: t'nin hücresine bak, AL kuralları geçerse pozisyon aç
+    - Overlap yok: pozisyon açıkken yeni sinyal göz ardı edilir
+    - Maliyet: round-trip komisyon, çıkış gününde tek seferde düşülür
+
+    Lookahead-free: t anındaki heatmap yalnızca t-horizon-1 ve öncesine bakar.
+
+    Returns
+    -------
+    dict
+        trades:   DataFrame (entry/exit tarih, fiyat, brüt/net getiri, hücre)
+        equity:   DataFrame (tarih, strategy_equity, bh_equity)
+        metrics:  dict (n_trades, total_ret, cagr, sharpe, max_dd, hit_rate, exposure ...)
+    """
+    horizon = int(target.replace("fwd_ret_", ""))
+    needed = [f"{primary}_pct", f"{secondary}_pct", close_col, target]
+    if not all(c in lab.columns for c in needed):
+        return None
+
+    df = lab[needed].copy()
+    df.columns = ["p_pct", "s_pct", "close", "fwd"]
+    df = df.reset_index(drop=False)
+    date_col = df.columns[0]
+
+    edges  = [-0.01, 1/3, 2/3, 1.01]
+    labels = ["low", "mid", "high"]
+    df["p_bin"] = pd.cut(df["p_pct"], bins=edges, labels=labels)
+    df["s_bin"] = pd.cut(df["s_pct"], bins=edges, labels=labels)
+
+    n_bars = len(df)
+    if n_bars < init_train + horizon + 10:
+        return None
+
+    def calibrate(end_idx: int) -> dict:
+        """0..end_idx-1 verisinden hücre-bazlı (mean, sharpe, n) tablosu."""
+        seg = df.iloc[:end_idx].dropna(subset=["fwd", "p_bin", "s_bin"])
+        if seg.empty:
+            return {}
+        out = {}
+        for (pb, sb), g in seg.groupby(["p_bin", "s_bin"], observed=False)["fwd"]:
+            if g.empty:
+                continue
+            mean = g.mean(); std = g.std(ddof=1); n = len(g)
+            sharpe = mean / std if std and std > 0 else np.nan
+            out[(pb, sb)] = {"mean": float(mean), "sharpe": float(sharpe), "n": int(n)}
+        return out
+
+    trades: list[dict] = []
+    pos: dict | None = None
+    cal: dict | None = None
+
+    for t in range(init_train, n_bars):
+        # 1) Pozisyon kapanışı
+        if pos and t >= pos["exit_idx"]:
+            ex = df.iloc[pos["exit_idx"]]
+            ret_g = float(ex["close"]) / pos["entry_price"] - 1
+            trades.append({
+                "entry_date":  pos["entry_date"],
+                "exit_date":   ex[date_col],
+                "entry_price": pos["entry_price"],
+                "exit_price":  float(ex["close"]),
+                "ret_gross":   ret_g,
+                "ret_net":     ret_g - commission,
+                "cell":        pos["cell"],
+            })
+            pos = None
+
+        # 2) Yeniden kalibrasyon
+        if cal is None or (t - init_train) % recalib_period == 0:
+            cal = calibrate(max(init_train, t - horizon))
+
+        # 3) Pozisyon açma
+        if pos is None:
+            row = df.iloc[t]
+            stats = cal.get((row["p_bin"], row["s_bin"]))
+            if (stats and pd.notna(stats["sharpe"])
+                and stats["n"] >= min_n
+                and abs(stats["sharpe"]) >= min_sharpe
+                and stats["mean"] > 0):
+                exit_idx = t + horizon
+                if exit_idx < n_bars:
+                    pos = {
+                        "entry_idx":   t,
+                        "entry_date":  row[date_col],
+                        "entry_price": float(row["close"]),
+                        "exit_idx":    exit_idx,
+                        "cell":        f"{row['p_bin']}×{row['s_bin']}",
+                    }
+
+    # 4) Equity curve (günlük yayma) ------------------------------------------
+    eq = df[[date_col, "close"]].iloc[init_train:].reset_index(drop=True)
+    daily_ret = eq["close"].pct_change().fillna(0)
+
+    in_pos = np.zeros(len(eq), dtype=bool)
+    for tr in trades:
+        # entry günü < tarih <= exit günü → o aralıktaki pct_change'ler pozisyonda
+        mask = (eq[date_col].values > np.datetime64(tr["entry_date"])) & \
+               (eq[date_col].values <= np.datetime64(tr["exit_date"]))
+        in_pos |= mask
+
+    strat_daily = daily_ret.values.copy() * in_pos
+    # Komisyon: her çıkış gününde -commission
+    date_idx = pd.Index(eq[date_col].values)
+    for tr in trades:
+        try:
+            i = date_idx.get_loc(np.datetime64(tr["exit_date"]))
+            if isinstance(i, slice):
+                i = i.start
+            strat_daily[i] -= commission
+        except KeyError:
+            pass
+
+    strat_eq = (1 + pd.Series(strat_daily, index=eq.index)).cumprod()
+    bh_eq    = (1 + daily_ret).cumprod()
+
+    equity = eq.copy()
+    equity["strategy"] = strat_eq.values
+    equity["bh"]       = bh_eq.values
+
+    # 5) Metrikler ------------------------------------------------------------
+    trades_df = pd.DataFrame(trades)
+    if trades_df.empty:
+        return {"trades": trades_df, "equity": equity, "metrics": {"n_trades": 0}}
+
+    n_years = max((eq[date_col].iloc[-1] - eq[date_col].iloc[0]).days / 365.25, 1e-6)
+    total_strat = float(strat_eq.iloc[-1]) - 1
+    total_bh    = float(bh_eq.iloc[-1])    - 1
+    cagr_strat  = (float(strat_eq.iloc[-1]) ** (1/n_years) - 1) if strat_eq.iloc[-1] > 0 else np.nan
+    cagr_bh     = (float(bh_eq.iloc[-1])    ** (1/n_years) - 1) if bh_eq.iloc[-1]    > 0 else np.nan
+
+    # Annualized Sharpe (252 trading days) — sadece pozisyonda olunan günlerden
+    active = pd.Series(strat_daily)[pd.Series(strat_daily) != 0]
+    sharpe_strat = (active.mean() / active.std() * np.sqrt(252)
+                    if len(active) > 1 and active.std() > 0 else np.nan)
+    sharpe_bh = (daily_ret.mean() / daily_ret.std() * np.sqrt(252)
+                 if daily_ret.std() > 0 else np.nan)
+
+    dd      = strat_eq / strat_eq.cummax() - 1
+    dd_bh   = bh_eq    / bh_eq.cummax()    - 1
+
+    metrics = {
+        "n_trades":     int(len(trades_df)),
+        "total_ret":    total_strat,
+        "total_ret_bh": total_bh,
+        "cagr":         cagr_strat,
+        "cagr_bh":      cagr_bh,
+        "sharpe":       float(sharpe_strat) if pd.notna(sharpe_strat) else np.nan,
+        "sharpe_bh":    float(sharpe_bh)    if pd.notna(sharpe_bh)    else np.nan,
+        "max_dd":       float(dd.min()),
+        "max_dd_bh":    float(dd_bh.min()),
+        "hit_rate":     float((trades_df["ret_net"] > 0).mean()),
+        "exposure":     float(in_pos.mean()),
+        "n_years":      float(n_years),
+    }
+    return {"trades": trades_df, "equity": equity, "metrics": metrics}
+
+
 def _which_bin(pct: float) -> str | None:
     """Persentil değerini low/mid/high diliminden birine eşler."""
     if pd.isna(pct):
@@ -1104,10 +1273,130 @@ def _render_signal_card(lab: pd.DataFrame, *, scale: str, ticker: str) -> None:
         st.dataframe(show.round(4), hide_index=True, use_container_width=True)
 
 
+def _render_backtest(lab: pd.DataFrame, *, scale: str, ticker: str) -> None:
+    """Aşama 4 — Walk-forward backtest paneli."""
+    feat_cols = LAB_FEATURES_DAILY if scale == "daily" else LAB_FEATURES_INTRADAY
+    ret_col = "Günlük Değ. (%)" if scale == "daily" else "Değişim (%)"
+    feat_cols = [c for c in feat_cols if c in lab.columns and c != ret_col]
+    fwd_cols  = [c for c in lab.columns if c.startswith("fwd_ret_")]
+    close_col = LAB_CLOSE_COL.get(scale, "")
+
+    if not fwd_cols or len(feat_cols) < 2:
+        st.warning("⚠️ Backtest için forward return + en az 2 feature gerekli.")
+        return
+
+    # Kontroller --------------------------------------------------------------
+    default_secondary = "ATR" if "ATR" in feat_cols else feat_cols[-1]
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        primary = st.selectbox("Likidite ekseni", feat_cols, index=0, key=f"bt_p_{scale}")
+    with c2:
+        secondary = st.selectbox("Volatilite ekseni", feat_cols,
+                                 index=feat_cols.index(default_secondary),
+                                 key=f"bt_s_{scale}")
+    with c3:
+        target = st.selectbox("Hedef ufuk", fwd_cols, index=len(fwd_cols) - 1,
+                              key=f"bt_t_{scale}")
+
+    c4, c5, c6 = st.columns(3)
+    with c4:
+        min_sharpe = st.slider("Min Sharpe", 0.05, 0.50, 0.15, 0.05,
+                               key=f"bt_msh_{scale}")
+    with c5:
+        min_n = st.slider("Min n", 20, 300, 50, 10, key=f"bt_mn_{scale}")
+    with c6:
+        commission = st.slider("Komisyon (round-trip)", 0.0, 0.005, 0.001, 0.0005,
+                               format="%.4f", key=f"bt_com_{scale}")
+
+    c7, c8 = st.columns(2)
+    with c7:
+        max_init = 504 if scale == "daily" else 100
+        default_init = 252 if scale == "daily" else 60
+        init_train = st.slider("İlk kalibrasyon (bar)", 60, max_init, default_init, 20,
+                               key=f"bt_init_{scale}")
+    with c8:
+        recalib = st.slider("Yeniden kalibrasyon aralığı (bar)", 10, 120, 60, 10,
+                            key=f"bt_rec_{scale}")
+
+    if primary == secondary:
+        st.info("Aynı metrik iki eksende — farklı seç.")
+        return
+
+    if not st.button("🚀 Backtest çalıştır", key=f"bt_run_{scale}", type="primary"):
+        st.caption("Sinyal Kartı kontrollerini buraya kopyala ve butona bas. "
+                   "Walk-forward simülasyon ağır olabilir (büyük datasette ~5-10 sn).")
+        return
+
+    with st.spinner("Walk-forward simülasyon çalışıyor…"):
+        res = run_backtest(lab, primary=primary, secondary=secondary,
+                           target=target, close_col=close_col,
+                           init_train=init_train, recalib_period=recalib,
+                           min_sharpe=min_sharpe, min_n=min_n,
+                           commission=commission)
+
+    if res is None:
+        st.error("⚠️ Backtest başarısız — yetersiz veri veya eksik sütun.")
+        return
+    if res["metrics"].get("n_trades", 0) == 0:
+        st.warning("Hiç trade üretilmedi. Min_sharpe ve min_n eşiklerini düşür.")
+        return
+
+    m = res["metrics"]
+    horizon_n = target.replace("fwd_ret_", "")
+    unit = "bar" if scale == "intraday" else "gün"
+
+    # Performans özeti --------------------------------------------------------
+    st.markdown(f"### 📊 Performans · {ticker} · {primary} × {secondary} · ufuk {horizon_n} {unit}")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Toplam getiri", f"{m['total_ret']:+.1%}",
+              f"vs B&H {(m['total_ret'] - m['total_ret_bh']):+.1%}")
+    c2.metric("CAGR", f"{m['cagr']:+.2%}",
+              f"vs B&H {(m['cagr'] - m['cagr_bh']):+.2%}")
+    c3.metric("Sharpe (yıllık)",
+              f"{m['sharpe']:.2f}" if pd.notna(m['sharpe']) else "—",
+              f"vs B&H {(m['sharpe'] - m['sharpe_bh']):+.2f}" if pd.notna(m['sharpe']) and pd.notna(m['sharpe_bh']) else None)
+    c4.metric("Max DD", f"{m['max_dd']:.1%}",
+              f"vs B&H {(m['max_dd'] - m['max_dd_bh']):+.1%}",
+              delta_color="inverse")
+
+    c5, c6, c7 = st.columns(3)
+    c5.metric("Hit-rate (trade)", f"{m['hit_rate']:.0%}")
+    c6.metric("Trade sayısı", f"{m['n_trades']}")
+    c7.metric("Piyasada zaman", f"{m['exposure']:.0%}")
+
+    # Equity curve ------------------------------------------------------------
+    st.markdown("### 📈 Equity curve (1.0 = başlangıç sermayesi)")
+    eq = res["equity"]
+    date_col = eq.columns[0]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=eq[date_col], y=eq["strategy"], name="Strateji",
+                             line=dict(color="#16a34a", width=2)))
+    fig.add_trace(go.Scatter(x=eq[date_col], y=eq["bh"], name="Buy & Hold",
+                             line=dict(color="#737373", width=1, dash="dash")))
+    fig.update_layout(height=420, margin=dict(l=10, r=10, t=10, b=10),
+                      yaxis_title="Equity", hovermode="x unified",
+                      legend=dict(orientation="h", yanchor="bottom", y=1.0))
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Trade listesi -----------------------------------------------------------
+    with st.expander(f"📋 Trade listesi ({m['n_trades']} işlem)"):
+        tr = res["trades"].copy()
+        if hasattr(tr["entry_date"].iloc[0], "strftime"):
+            tr["entry_date"] = pd.to_datetime(tr["entry_date"]).dt.strftime("%d.%m.%Y")
+            tr["exit_date"]  = pd.to_datetime(tr["exit_date"]).dt.strftime("%d.%m.%Y")
+        tr["ret_gross"] = (tr["ret_gross"] * 100).round(2)
+        tr["ret_net"]   = (tr["ret_net"]   * 100).round(2)
+        tr["entry_price"] = tr["entry_price"].round(2)
+        tr["exit_price"]  = tr["exit_price"].round(2)
+        tr.columns = ["Giriş", "Çıkış", "Giriş ₺", "Çıkış ₺",
+                      "Brüt (%)", "Net (%)", "Hücre"]
+        st.dataframe(tr, hide_index=True, use_container_width=True)
+
+
 def render_lab_panel(metrics: pd.DataFrame, *, scale: str,
                      horizons: list[int], lookback: int,
                      ticker: str = "") -> None:
-    """Lab paneli — Altyapı + L1 Heatmap + Sinyal Kartı (tabs)."""
+    """Lab paneli — Altyapı + L1 Heatmap + Sinyal Kartı + Backtest (tabs)."""
     if metrics is None or metrics.empty:
         st.info("🔬 Lab: veri yok.")
         return
@@ -1120,15 +1409,20 @@ def render_lab_panel(metrics: pd.DataFrame, *, scale: str,
         f"Ufuklar: **{horizons}** · Frame: **{lab.shape[0]} × {lab.shape[1]}**"
     )
 
-    tab_setup, tab_l1, tab_sig = st.tabs(
-        ["📦 Aşama 1 — Altyapı", "🔥 L1 — Koşullu Heatmap", "🎯 Sinyal Kartı"]
-    )
+    tab_setup, tab_l1, tab_sig, tab_bt = st.tabs([
+        "📦 Aşama 1 — Altyapı",
+        "🔥 L1 — Koşullu Heatmap",
+        "🎯 Sinyal Kartı",
+        "📊 Backtest",
+    ])
     with tab_setup:
         _render_lab_setup(lab, scale=scale)
     with tab_l1:
         _render_l1_heatmap(lab, scale=scale)
     with tab_sig:
         _render_signal_card(lab, scale=scale, ticker=ticker)
+    with tab_bt:
+        _render_backtest(lab, scale=scale, ticker=ticker)
 
 
 def color_val(val, col):
