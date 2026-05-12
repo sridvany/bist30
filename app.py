@@ -720,6 +720,102 @@ def build_l1_heatmap(lab: pd.DataFrame, *, primary: str, secondary: str,
     return out
 
 
+# ── Aşama 3 — Sinyal Kartı yardımcıları ──────────────────────────────────────
+def _which_bin(pct: float) -> str | None:
+    """Persentil değerini low/mid/high diliminden birine eşler."""
+    if pd.isna(pct):
+        return None
+    if pct < 1/3:  return "low"
+    if pct < 2/3:  return "mid"
+    return "high"
+
+
+def build_signal(lab: pd.DataFrame, *, primary: str, secondary: str,
+                 target: str, close_col: str,
+                 min_sharpe: float = 0.15, min_n: int = 50) -> dict:
+    """Son bar için AL/SAT/BEKLE kararı + tarihsel beklenti + fiyat hedefleri.
+
+    Adımlar
+    -------
+    1) Son barın primary_pct ve secondary_pct değerleri → düşülen 3×3 hücre
+    2) O hücrenin tarihsel istatistikleri (mean, hit_rate, sharpe, n)
+    3) Eşik (min_sharpe, min_n) ile karar; Sharpe büyüklüğüne göre yıldız (★…★★★)
+    4) Stop/hedef: (a) ATR çarpanı 1.5× / 3×, (b) hücredeki tarihsel q25/q75
+    5) Hipotez kataloğu: tüm 9 hücre, |sharpe| sıralı
+    """
+    last_p = lab[f"{primary}_pct"].iloc[-1]   if f"{primary}_pct"   in lab.columns else np.nan
+    last_s = lab[f"{secondary}_pct"].iloc[-1] if f"{secondary}_pct" in lab.columns else np.nan
+    p_bin, s_bin = _which_bin(last_p), _which_bin(last_s)
+
+    hm = build_l1_heatmap(lab, primary=primary, secondary=secondary,
+                          target=target, min_obs=min_n)
+
+    stats = None
+    if p_bin and s_bin and hm is not None:
+        row = hm[(hm["primary_bin"] == p_bin) & (hm["secondary_bin"] == s_bin)]
+        if not row.empty:
+            stats = row.iloc[0].to_dict()
+
+    # Karar -------------------------------------------------------------------
+    decision, stars = "VERİ YETERSİZ", ""
+    if stats and pd.notna(stats.get("n")) and stats["n"] >= min_n \
+       and pd.notna(stats.get("sharpe")) and pd.notna(stats.get("mean")):
+        abs_sh = abs(stats["sharpe"])
+        if abs_sh < min_sharpe:
+            decision = "BEKLE"
+        else:
+            stars = "★★★" if abs_sh >= 0.50 else ("★★" if abs_sh >= 0.30 else "★")
+            decision = "AL" if stats["mean"] > 0 else "SAT"
+
+    # Tarihsel quantile (aktif hücrenin örneklerinin fwd_ret dağılımı) --------
+    last_close = float(lab[close_col].iloc[-1]) if close_col in lab.columns else None
+    last_atr   = float(lab["ATR"].iloc[-1])      if "ATR"     in lab.columns else None
+
+    q25_pct = q75_pct = q25_price = q75_price = None
+    if p_bin and s_bin and target in lab.columns:
+        edges = [-0.01, 1/3, 2/3, 1.01]
+        labels = ["low", "mid", "high"]
+        pb = pd.cut(lab[f"{primary}_pct"],   bins=edges, labels=labels)
+        sb = pd.cut(lab[f"{secondary}_pct"], bins=edges, labels=labels)
+        mask = (pb == p_bin) & (sb == s_bin)
+        sample = lab.loc[mask, target].dropna()
+        if len(sample) >= 5:
+            q25_pct = float(sample.quantile(0.25))
+            q75_pct = float(sample.quantile(0.75))
+            if last_close:
+                q25_price = last_close * (1 + q25_pct / 100)
+                q75_price = last_close * (1 + q75_pct / 100)
+
+    # ATR-bazlı stop/hedef (long varsayımı; SAT'ta işaretler ters) ------------
+    atr_stop = atr_target = None
+    if last_atr and last_close:
+        if decision == "SAT":
+            atr_stop   = last_close + 1.5 * last_atr
+            atr_target = last_close - 3.0 * last_atr
+        else:
+            atr_stop   = last_close - 1.5 * last_atr
+            atr_target = last_close + 3.0 * last_atr
+
+    # Hipotez kataloğu --------------------------------------------------------
+    catalog = None
+    if hm is not None:
+        catalog = hm.copy()
+        catalog["abs_sharpe"] = catalog["sharpe"].abs()
+        catalog = catalog.sort_values("abs_sharpe", ascending=False, na_position="last")
+
+    return {
+        "p_bin": p_bin, "s_bin": s_bin,
+        "last_p_pct": last_p, "last_s_pct": last_s,
+        "stats": stats,
+        "decision": decision, "stars": stars,
+        "atr_stop": atr_stop, "atr_target": atr_target,
+        "q25_pct": q25_pct, "q75_pct": q75_pct,
+        "q25_price": q25_price, "q75_price": q75_price,
+        "last_close": last_close, "last_atr": last_atr,
+        "catalog": catalog,
+    }
+
+
 def _render_lab_setup(lab: pd.DataFrame, *, scale: str) -> None:
     """Aşama 1 — Altyapı sekmesi (son bar kartı, fwd_ret özet, tail)."""
     feat_cols = LAB_FEATURES_DAILY if scale == "daily" else LAB_FEATURES_INTRADAY
@@ -853,9 +949,165 @@ def _render_l1_heatmap(lab: pd.DataFrame, *, scale: str) -> None:
         st.dataframe(show.round(4), use_container_width=True, hide_index=True)
 
 
+def _render_signal_card(lab: pd.DataFrame, *, scale: str, ticker: str) -> None:
+    """Aşama 3 — Sinyal Kartı v0: son bar için AL/SAT/BEKLE."""
+    feat_cols = LAB_FEATURES_DAILY if scale == "daily" else LAB_FEATURES_INTRADAY
+    ret_col = "Günlük Değ. (%)" if scale == "daily" else "Değişim (%)"
+    feat_cols = [c for c in feat_cols if c in lab.columns and c != ret_col]
+    fwd_cols  = [c for c in lab.columns if c.startswith("fwd_ret_")]
+    close_col = LAB_CLOSE_COL.get(scale, "")
+
+    if not fwd_cols:
+        st.warning("⚠️ Sinyal kartı için forward return gerekli. Sidebar'da en az bir ufuk seç.")
+        return
+    if len(feat_cols) < 2:
+        st.warning("⚠️ Sinyal kartı için en az 2 feature gerekli.")
+        return
+
+    # Kontroller --------------------------------------------------------------
+    default_secondary = "ATR" if "ATR" in feat_cols else feat_cols[-1]
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        primary = st.selectbox("Likidite ekseni", feat_cols, index=0,
+                               key=f"sig_p_{scale}")
+    with c2:
+        secondary = st.selectbox("Volatilite ekseni", feat_cols,
+                                 index=feat_cols.index(default_secondary),
+                                 key=f"sig_s_{scale}")
+    with c3:
+        target = st.selectbox("Hedef ufuk", fwd_cols, index=len(fwd_cols) - 1,
+                              key=f"sig_t_{scale}",
+                              help="L1'de en güçlü gözüken ufku seç (genelde en uzun)")
+
+    c4, c5 = st.columns(2)
+    with c4:
+        min_sharpe = st.slider("Min Sharpe (eşik)", 0.05, 0.50, 0.15, 0.05,
+                               key=f"sig_msh_{scale}",
+                               help="Bu eşiğin altındaki hücreler BEKLE üretir")
+    with c5:
+        min_n = st.slider("Min gözlem (n)", 20, 300, 50, 10,
+                          key=f"sig_mn_{scale}")
+
+    if primary == secondary:
+        st.info("Aynı metrik iki eksende — farklı seç.")
+        return
+
+    sig = build_signal(lab, primary=primary, secondary=secondary, target=target,
+                       close_col=close_col, min_sharpe=min_sharpe, min_n=min_n)
+
+    # Karar kartı -------------------------------------------------------------
+    deco_color = {"AL": "#16a34a", "SAT": "#dc2626"}.get(sig["decision"], "#737373")
+    last_date = lab.index[-1]
+    last_date_str = last_date.strftime("%d.%m.%Y %H:%M") if hasattr(last_date, "strftime") else str(last_date)
+    if scale == "daily" and hasattr(last_date, "strftime"):
+        last_date_str = last_date.strftime("%d.%m.%Y")
+    horizon_n = target.replace("fwd_ret_", "")
+    unit = "bar" if scale == "intraday" else "gün"
+
+    st.markdown(
+        f"""
+        <div style="border:2px solid {deco_color}; border-radius:12px;
+                    padding:18px 22px; margin:8px 0; background:rgba(0,0,0,0.15);">
+          <div style="font-size:13px; color:#aaa;">
+            <b>{ticker}</b> · {last_date_str} · {horizon_n} {unit} ileri sinyal
+          </div>
+          <div style="font-size:34px; font-weight:700; color:{deco_color}; margin:4px 0;">
+            {sig['decision']} <span style="font-size:24px;">{sig['stars']}</span>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # Mevcut rejim
+    if sig["p_bin"] and sig["s_bin"]:
+        st.markdown(
+            f"**Mevcut rejim** · {primary} = `{sig['p_bin']}` (pct {sig['last_p_pct']:.2f}) "
+            f"× {secondary} = `{sig['s_bin']}` (pct {sig['last_s_pct']:.2f})"
+        )
+    else:
+        st.warning("Son barda pct değeri NaN — lookback yetersiz olabilir.")
+        return
+
+    # Tarihsel beklenti
+    stats = sig.get("stats")
+    if stats and pd.notna(stats.get("n")):
+        mc1, mc2, mc3, mc4 = st.columns(4)
+        mc1.metric("Tarihsel ort. (%)",
+                   f"{stats['mean']:+.2f}" if pd.notna(stats.get("mean")) else "—")
+        mc2.metric("Hit-rate",
+                   f"{stats['hit_rate']:.0%}" if pd.notna(stats.get("hit_rate")) else "—")
+        mc3.metric("Sharpe",
+                   f"{stats['sharpe']:+.2f}" if pd.notna(stats.get("sharpe")) else "—")
+        mc4.metric("n (gözlem)", f"{int(stats['n'])}")
+
+    # Fiyat hedefleri (yalnızca AL/SAT) ---------------------------------------
+    if sig["decision"] in ("AL", "SAT") and sig["last_close"]:
+        st.markdown("**🎯 Fiyat hedefleri** (her iki yöntem)")
+        def _pct_to(price):
+            return (price / sig["last_close"] - 1) * 100 if price else None
+
+        rows = []
+        if sig["atr_stop"] is not None and sig["atr_target"] is not None:
+            rows.append({
+                "Yöntem": "ATR çarpanı (1.5× / 3×)",
+                "Stop":     f"{sig['atr_stop']:.2f}",
+                "Hedef":    f"{sig['atr_target']:.2f}",
+                "Stop (%)": f"{_pct_to(sig['atr_stop']):+.2f}%",
+                "Hedef (%)":f"{_pct_to(sig['atr_target']):+.2f}%",
+            })
+        if sig["q25_pct"] is not None and sig["q75_pct"] is not None:
+            rows.append({
+                "Yöntem": "Tarihsel quantile (q25 / q75)",
+                "Stop":     f"{sig['q25_price']:.2f}",
+                "Hedef":    f"{sig['q75_price']:.2f}",
+                "Stop (%)": f"{sig['q25_pct']:+.2f}%",
+                "Hedef (%)":f"{sig['q75_pct']:+.2f}%",
+            })
+        if rows:
+            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+        st.caption(
+            f"Son fiyat: **{sig['last_close']:.2f}**"
+            + (f" · ATR: **{sig['last_atr']:.2f}**" if sig["last_atr"] else "")
+            + f" · Ufuk: **{horizon_n} {unit}**"
+        )
+    elif sig["decision"] == "BEKLE":
+        st.info("⏸️ Bu rejimde Sharpe eşik altında — beklemek tarihsel olarak daha güvenli.")
+    elif sig["decision"] == "VERİ YETERSİZ":
+        st.warning("⚠️ Bu hücrede yeterli geçmiş gözlem yok (n < min). Eşiği düşür ya da farklı ufuk dene.")
+
+    # Hipotez kataloğu --------------------------------------------------------
+    st.markdown("---")
+    st.markdown("**🗂️ Hipotez kataloğu** — tüm 9 hücre, |Sharpe| sıralı; ▶ = aktif hücre")
+    cat = sig.get("catalog")
+    if cat is not None and not cat.empty:
+        def _status(r):
+            if pd.isna(r["sharpe"]) or pd.isna(r["n"]):
+                return "veri yok"
+            if r["n"] < min_n:
+                return f"yetersiz (n<{min_n})"
+            if abs(r["sharpe"]) < min_sharpe:
+                return "zayıf"
+            return "AL" if r["mean"] > 0 else "SAT"
+
+        def _mark(r):
+            return "▶" if (r["primary_bin"] == sig["p_bin"]
+                           and r["secondary_bin"] == sig["s_bin"]) else ""
+
+        cat = cat.copy()
+        cat["aktif"] = cat.apply(_mark, axis=1)
+        cat["durum"] = cat.apply(_status, axis=1)
+        show = cat[["aktif", "primary_bin", "secondary_bin",
+                    "n", "mean", "hit_rate", "sharpe", "durum"]].copy()
+        show.columns = ["", f"{primary}", f"{secondary}",
+                        "n", "mean (%)", "hit-rate", "sharpe", "durum"]
+        st.dataframe(show.round(4), hide_index=True, use_container_width=True)
+
+
 def render_lab_panel(metrics: pd.DataFrame, *, scale: str,
-                     horizons: list[int], lookback: int) -> None:
-    """Lab paneli — Altyapı + L1 Heatmap (tabs)."""
+                     horizons: list[int], lookback: int,
+                     ticker: str = "") -> None:
+    """Lab paneli — Altyapı + L1 Heatmap + Sinyal Kartı (tabs)."""
     if metrics is None or metrics.empty:
         st.info("🔬 Lab: veri yok.")
         return
@@ -868,11 +1120,15 @@ def render_lab_panel(metrics: pd.DataFrame, *, scale: str,
         f"Ufuklar: **{horizons}** · Frame: **{lab.shape[0]} × {lab.shape[1]}**"
     )
 
-    tab_setup, tab_l1 = st.tabs(["📦 Aşama 1 — Altyapı", "🔥 L1 — Koşullu Heatmap"])
+    tab_setup, tab_l1, tab_sig = st.tabs(
+        ["📦 Aşama 1 — Altyapı", "🔥 L1 — Koşullu Heatmap", "🎯 Sinyal Kartı"]
+    )
     with tab_setup:
         _render_lab_setup(lab, scale=scale)
     with tab_l1:
         _render_l1_heatmap(lab, scale=scale)
+    with tab_sig:
+        _render_signal_card(lab, scale=scale, ticker=ticker)
 
 
 def color_val(val, col):
@@ -1132,7 +1388,8 @@ if run or "last_ticker" in st.session_state:
 
             if lab_mode:
                 render_lab_panel(intra, scale="intraday",
-                                 horizons=lab_horizons, lookback=lab_lookback)
+                                 horizons=lab_horizons, lookback=lab_lookback,
+                                 ticker=_ticker)
                 st.markdown("---")
 
             # Resmi kapanış (auction dahil) için 1d seri; bar-level metrikler 2dk seriden
@@ -1447,7 +1704,8 @@ if run or "last_ticker" in st.session_state:
 
         if lab_mode:
             render_lab_panel(metrics, scale="daily",
-                             horizons=lab_horizons, lookback=lab_lookback)
+                             horizons=lab_horizons, lookback=lab_lookback,
+                             ticker=_ticker)
             st.markdown("---")
 
         atr_series_d = metrics["ATR"].dropna()
