@@ -724,7 +724,7 @@ def build_l1_heatmap(lab: pd.DataFrame, *, primary: str, secondary: str,
 def run_backtest(lab: pd.DataFrame, *, primary: str, secondary: str,
                  target: str, close_col: str,
                  init_train: int = 252, recalib_period: int = 60,
-                 min_sharpe: float = 0.15, min_n: int = 50,
+                 min_sharpe: float = 0.50, min_n: int = 50,
                  commission: float = 0.001) -> dict | None:
     """Walk-forward backtest — long-only, sabit ufuk.
 
@@ -901,53 +901,126 @@ def _which_bin(pct: float) -> str | None:
 
 def build_signal(lab: pd.DataFrame, *, primary: str, secondary: str,
                  target: str, close_col: str,
-                 min_sharpe: float = 0.15, min_n: int = 50) -> dict:
-    """Son bar için AL/SAT/BEKLE kararı + tarihsel beklenti + fiyat hedefleri.
+                 min_sharpe: float = 0.50, min_hit_rate: float = 0.55,
+                 min_n: int = 50, cv_window: int | None = None) -> dict:
+    """Son bar için AL/SAT/BEKLE kararı (OOS-validated) + fiyat hedefleri.
+
+    Walk-forward (Train/Test split)
+    -------------------------------
+    - Train = lab[:-cv_window]            → hücre stats yalnızca buradan öğrenilir
+    - Test  = lab[-cv_window:-horizon]    → OOS validasyon seti (purged)
+    - Karar OOS dağılıma göre verilir:
+        * Train sample size eşik (min_n) Train heatmap'inde
+        * |OOS Sharpe| ≥ min_sharpe
+        * Yön-tutarlı OOS hit_rate ≥ min_hit_rate
+    - cv_window None → veri uzunluğunun %20'si (min 60 bar)
 
     Adımlar
     -------
-    1) Son barın primary_pct ve secondary_pct değerleri → düşülen 3×3 hücre
-    2) O hücrenin tarihsel istatistikleri (mean, hit_rate, sharpe, n)
-    3) Eşik (min_sharpe, min_n) ile karar; Sharpe büyüklüğüne göre yıldız (★…★★★)
-    4) Stop/hedef: (a) ATR çarpanı 1.5× / 3×, (b) hücredeki tarihsel q25/q75
-    5) Hipotez kataloğu: tüm 9 hücre, |sharpe| sıralı
+    1) Train/Test split (son horizon bar test'ten purge)
+    2) Train heatmap → hipotez kataloğu + son barın Train hücre stats'ı
+    3) Test setinde son barın hücresine düşen örneklerden OOS stats
+    4) Karar: OOS Sharpe + OOS hit_rate eşikleri (her ikisi de geçmeli)
+    5) Stop/hedef: (a) ATR 1.5× / 3×, (b) Train hücre quantile q25/q75
     """
+    horizon_n = (int(target.replace("fwd_ret_", ""))
+                 if target.startswith("fwd_ret_") and target[8:].isdigit() else 1)
+    n_total = len(lab)
+    if cv_window is None:
+        cv_window = max(60, n_total // 5)
+
     last_p = lab[f"{primary}_pct"].iloc[-1]   if f"{primary}_pct"   in lab.columns else np.nan
     last_s = lab[f"{secondary}_pct"].iloc[-1] if f"{secondary}_pct" in lab.columns else np.nan
     p_bin, s_bin = _which_bin(last_p), _which_bin(last_s)
 
-    hm = build_l1_heatmap(lab, primary=primary, secondary=secondary,
+    # 1) Train/Test split (purged) --------------------------------------------
+    can_split = n_total >= cv_window + horizon_n + min_n
+    if can_split:
+        train_end = n_total - cv_window
+        train_lab = lab.iloc[:train_end]
+        test_lab  = lab.iloc[train_end:]
+        if horizon_n > 0 and len(test_lab) > horizon_n:
+            test_lab = test_lab.iloc[:-horizon_n]
+        else:
+            test_lab = pd.DataFrame()
+    else:
+        train_lab = lab
+        test_lab  = pd.DataFrame()
+
+    # 2) Train heatmap (hipotez kataloğu + son barın hücre stats'ı) -----------
+    hm = build_l1_heatmap(train_lab, primary=primary, secondary=secondary,
                           target=target, min_obs=min_n)
 
-    stats = None
+    train_stats = None
     if p_bin and s_bin and hm is not None:
         row = hm[(hm["primary_bin"] == p_bin) & (hm["secondary_bin"] == s_bin)]
         if not row.empty:
-            stats = row.iloc[0].to_dict()
+            train_stats = row.iloc[0].to_dict()
 
-    # Karar -------------------------------------------------------------------
+    # 3) OOS validation -------------------------------------------------------
+    oos_stats = None
+    if p_bin and s_bin and not test_lab.empty and target in test_lab.columns \
+       and f"{primary}_pct" in test_lab.columns and f"{secondary}_pct" in test_lab.columns:
+        edges  = [-0.01, 1/3, 2/3, 1.01]
+        labels = ["low", "mid", "high"]
+        tp = pd.cut(test_lab[f"{primary}_pct"],   bins=edges, labels=labels)
+        ts = pd.cut(test_lab[f"{secondary}_pct"], bins=edges, labels=labels)
+        mask = (tp == p_bin) & (ts == s_bin)
+        sample = test_lab.loc[mask, target].dropna()
+        if len(sample) >= 5:
+            mean_v   = float(sample.mean())
+            std_v    = float(sample.std(ddof=1)) if len(sample) > 1 else np.nan
+            sharpe_v = mean_v / std_v if std_v and std_v > 0 else np.nan
+            hit_v    = float((sample > 0).mean())
+            oos_stats = {
+                "mean": mean_v, "std": std_v, "sharpe": sharpe_v,
+                "hit_rate": hit_v, "n": int(len(sample)),
+            }
+
+    # 4) Karar mekanizması (OOS-first) ----------------------------------------
     decision, stars = "VERİ YETERSİZ", ""
-    if stats and pd.notna(stats.get("n")) and stats["n"] >= min_n \
-       and pd.notna(stats.get("sharpe")) and pd.notna(stats.get("mean")):
-        abs_sh = abs(stats["sharpe"])
-        if abs_sh < min_sharpe:
+    train_n_ok = (train_stats is not None
+                  and pd.notna(train_stats.get("n"))
+                  and train_stats["n"] >= min_n)
+
+    if not can_split:
+        # OOS yapılamadı — in-sample karara izin verme, BEKLE
+        if train_n_ok:
+            decision = "BEKLE"
+    elif oos_stats and oos_stats["n"] >= 5 and train_n_ok:
+        oos_sh = oos_stats["sharpe"]
+        oos_hr = oos_stats["hit_rate"]
+        oos_mean = oos_stats["mean"]
+        if pd.isna(oos_sh) or pd.isna(oos_mean):
+            decision = "BEKLE"
+        elif abs(oos_sh) < min_sharpe:
             decision = "BEKLE"
         else:
-            stars = "★★★" if abs_sh >= 0.50 else ("★★" if abs_sh >= 0.30 else "★")
-            decision = "AL" if stats["mean"] > 0 else "SAT"
+            # Yön-tutarlı hit-rate: AL için >0 oranı, SAT için <0 oranı
+            effective_hr = oos_hr if oos_mean > 0 else (1 - oos_hr)
+            if effective_hr < min_hit_rate:
+                decision = "BEKLE"
+            else:
+                abs_sh = abs(oos_sh)
+                stars = "★★★" if abs_sh >= 1.0 else ("★★" if abs_sh >= 0.75 else "★")
+                decision = "AL" if oos_mean > 0 else "SAT"
+    elif train_n_ok:
+        # OOS örnek sayısı yetersiz (hücre OOS'ta nadir) — BEKLE
+        decision = "BEKLE"
 
-    # Tarihsel quantile (aktif hücrenin örneklerinin fwd_ret dağılımı) --------
+    # 5) Fiyat hedefleri (Train hücre quantile + ATR) -------------------------
     last_close = float(lab[close_col].iloc[-1]) if close_col in lab.columns else None
     last_atr   = float(lab["ATR"].iloc[-1])      if "ATR"     in lab.columns else None
 
     q25_pct = q75_pct = q25_price = q75_price = None
-    if p_bin and s_bin and target in lab.columns:
+    if p_bin and s_bin and target in train_lab.columns \
+       and f"{primary}_pct" in train_lab.columns and f"{secondary}_pct" in train_lab.columns:
         edges = [-0.01, 1/3, 2/3, 1.01]
         labels = ["low", "mid", "high"]
-        pb = pd.cut(lab[f"{primary}_pct"],   bins=edges, labels=labels)
-        sb = pd.cut(lab[f"{secondary}_pct"], bins=edges, labels=labels)
+        pb = pd.cut(train_lab[f"{primary}_pct"],   bins=edges, labels=labels)
+        sb = pd.cut(train_lab[f"{secondary}_pct"], bins=edges, labels=labels)
         mask = (pb == p_bin) & (sb == s_bin)
-        sample = lab.loc[mask, target].dropna()
+        sample = train_lab.loc[mask, target].dropna()
         if len(sample) >= 5:
             q25_pct = float(sample.quantile(0.25))
             q75_pct = float(sample.quantile(0.75))
@@ -955,7 +1028,6 @@ def build_signal(lab: pd.DataFrame, *, primary: str, secondary: str,
                 q25_price = last_close * (1 + q25_pct / 100)
                 q75_price = last_close * (1 + q75_pct / 100)
 
-    # ATR-bazlı stop/hedef (long varsayımı; SAT'ta işaretler ters) ------------
     atr_stop = atr_target = None
     if last_atr and last_close:
         if decision == "SAT":
@@ -965,7 +1037,7 @@ def build_signal(lab: pd.DataFrame, *, primary: str, secondary: str,
             atr_stop   = last_close - 1.5 * last_atr
             atr_target = last_close + 3.0 * last_atr
 
-    # Hipotez kataloğu --------------------------------------------------------
+    # Hipotez kataloğu (Train heatmap) ----------------------------------------
     catalog = None
     if hm is not None:
         catalog = hm.copy()
@@ -975,13 +1047,16 @@ def build_signal(lab: pd.DataFrame, *, primary: str, secondary: str,
     return {
         "p_bin": p_bin, "s_bin": s_bin,
         "last_p_pct": last_p, "last_s_pct": last_s,
-        "stats": stats,
-        "decision": decision, "stars": stars,
-        "atr_stop": atr_stop, "atr_target": atr_target,
-        "q25_pct": q25_pct, "q75_pct": q75_pct,
-        "q25_price": q25_price, "q75_price": q75_price,
+        "stats":      train_stats,   # Train (in-sample) hücre stats — görüntü için
+        "oos_stats":  oos_stats,     # OOS validation stats — kararın temeli
+        "cv_window":  cv_window,
+        "can_split":  can_split,
+        "decision":   decision, "stars": stars,
+        "atr_stop":   atr_stop, "atr_target": atr_target,
+        "q25_pct":    q25_pct, "q75_pct": q75_pct,
+        "q25_price":  q25_price, "q75_price": q75_price,
         "last_close": last_close, "last_atr": last_atr,
-        "catalog": catalog,
+        "catalog":    catalog,
     }
 
 
@@ -1148,21 +1223,26 @@ def _render_signal_card(lab: pd.DataFrame, *, scale: str, ticker: str) -> None:
                               key=f"sig_t_{scale}",
                               help="L1'de en güçlü gözüken ufku seç (genelde en uzun)")
 
-    c4, c5 = st.columns(2)
+    c4, c5, c6 = st.columns(3)
     with c4:
-        min_sharpe = st.slider("Min Sharpe (eşik)", 0.05, 0.50, 0.15, 0.05,
+        min_sharpe = st.slider("Min |Sharpe| (OOS)", 0.10, 1.50, 0.50, 0.05,
                                key=f"sig_msh_{scale}",
-                               help="Bu eşiğin altındaki hücreler BEKLE üretir")
+                               help="OOS Sharpe bu eşiğin altındaysa BEKLE")
     with c5:
-        min_n = st.slider("Min gözlem (n)", 20, 300, 50, 10,
-                          key=f"sig_mn_{scale}")
+        min_hit_rate = st.slider("Min hit-rate (OOS)", 0.40, 0.80, 0.55, 0.01,
+                                 key=f"sig_mhr_{scale}",
+                                 help="Yön-tutarlı OOS hit-rate eşiği "
+                                      "(AL için >0 oranı, SAT için <0 oranı)")
+    with c6:
+        min_n = st.slider("Min n (Train)", 20, 300, 50, 10, key=f"sig_mn_{scale}")
 
     if primary == secondary:
         st.info("Aynı metrik iki eksende — farklı seç.")
         return
 
     sig = build_signal(lab, primary=primary, secondary=secondary, target=target,
-                       close_col=close_col, min_sharpe=min_sharpe, min_n=min_n)
+                       close_col=close_col, min_sharpe=min_sharpe,
+                       min_hit_rate=min_hit_rate, min_n=min_n)
 
     # Karar kartı -------------------------------------------------------------
     deco_color = {"AL": "#16a34a", "SAT": "#dc2626"}.get(sig["decision"], "#737373")
@@ -1198,17 +1278,35 @@ def _render_signal_card(lab: pd.DataFrame, *, scale: str, ticker: str) -> None:
         st.warning("Son barda pct değeri NaN — lookback yetersiz olabilir.")
         return
 
-    # Tarihsel beklenti
+    # Tarihsel beklenti — Train (in-sample) + OOS yan yana
     stats = sig.get("stats")
+    oos   = sig.get("oos_stats")
+
     if stats and pd.notna(stats.get("n")):
+        st.markdown("**Train (in-sample) hücre stats** — hipotez")
         mc1, mc2, mc3, mc4 = st.columns(4)
-        mc1.metric("Tarihsel ort. (%)",
+        mc1.metric("Ortalama (%)",
                    f"{stats['mean']:+.2f}" if pd.notna(stats.get("mean")) else "—")
         mc2.metric("Hit-rate",
                    f"{stats['hit_rate']:.0%}" if pd.notna(stats.get("hit_rate")) else "—")
         mc3.metric("Sharpe",
                    f"{stats['sharpe']:+.2f}" if pd.notna(stats.get("sharpe")) else "—")
         mc4.metric("n (gözlem)", f"{int(stats['n'])}")
+
+    if oos:
+        st.markdown(f"**OOS validasyon** · son **{sig['cv_window']}** bar test seti — kararın temeli")
+        o1, o2, o3, o4 = st.columns(4)
+        o1.metric("OOS ort. (%)", f"{oos['mean']:+.2f}")
+        o2.metric("OOS hit-rate", f"{oos['hit_rate']:.0%}")
+        o3.metric("OOS Sharpe",
+                  f"{oos['sharpe']:+.2f}" if pd.notna(oos['sharpe']) else "—")
+        o4.metric("OOS n", f"{oos['n']}")
+    elif sig["can_split"]:
+        st.warning(f"⚠️ Son **{sig['cv_window']}** bar OOS test setinde bu hücreye "
+                   "yeterli (n≥5) örnek düşmemiş — OOS kararı verilemiyor.")
+    else:
+        st.warning("⚠️ Train/Test ayrımı yapılamadı (veri çok kısa). "
+                   "Daha uzun lookback gerekli.")
 
     # Fiyat hedefleri (yalnızca AL/SAT) ---------------------------------------
     if sig["decision"] in ("AL", "SAT") and sig["last_close"]:
@@ -1241,9 +1339,11 @@ def _render_signal_card(lab: pd.DataFrame, *, scale: str, ticker: str) -> None:
             + f" · Ufuk: **{horizon_n} {unit}**"
         )
     elif sig["decision"] == "BEKLE":
-        st.info("⏸️ Bu rejimde Sharpe eşik altında — beklemek tarihsel olarak daha güvenli.")
+        st.info("⏸️ OOS validasyon eşik aşmadı (Sharpe veya hit-rate) — "
+                "beklemek tarihsel olarak daha güvenli.")
     elif sig["decision"] == "VERİ YETERSİZ":
-        st.warning("⚠️ Bu hücrede yeterli geçmiş gözlem yok (n < min). Eşiği düşür ya da farklı ufuk dene.")
+        st.warning("⚠️ Train sample size yetersiz (n < min_n) veya "
+                   "Train/Test split yapılamadı. Lookback'i artır veya min_n'i düşür.")
 
     # Hipotez kataloğu --------------------------------------------------------
     st.markdown("---")
@@ -1300,7 +1400,7 @@ def _render_backtest(lab: pd.DataFrame, *, scale: str, ticker: str) -> None:
 
     c4, c5, c6 = st.columns(3)
     with c4:
-        min_sharpe = st.slider("Min Sharpe", 0.05, 0.50, 0.15, 0.05,
+        min_sharpe = st.slider("Min |Sharpe|", 0.10, 1.50, 0.50, 0.05,
                                key=f"bt_msh_{scale}")
     with c5:
         min_n = st.slider("Min n", 20, 300, 50, 10, key=f"bt_mn_{scale}")
